@@ -47,6 +47,7 @@ const DICED_PLAN_DAYS = 154; // 22 weeks × 7 days → Daily Log rows 5..158
 const DICED_PLAN_WEEKS = 22; // weekly rows 5..26, same rows as Weekly Check-in
 const DICED_TOKEN_KEY = 'DICED_TOKEN';
 const DICED_SCHEMA_KEY = 'DICED_SCHEMA_VERSION';
+const DICED_URL_KEY = 'DICED_WEBAPP_URL';
 const DICED_LOCK_MS = 20000;
 const DICED_MAX_BATCH = 1000;
 const DICED_MAX_TEXT = 20000;
@@ -147,6 +148,8 @@ const DICED_GAMEPLAN_CHECKIN = 'Weigh in every morning and snap a photo of the s
   "week's average weight. Measure waist (and his shoulders/chest) every other Monday. Enter " +
   'average daily steps for the past week.';
 
+const DICED_GAMEPLAN_ROW_PX = 60;
+
 const DICED_GAMEPLAN_DAILY = 'One row per day: weight, calories, protein and calorie target for ' +
   'each of you. The weekly block on the right shows average intake and "implied maintenance" — ' +
   'a check on how accurate the calorie estimates are.';
@@ -177,19 +180,38 @@ function rotateToken() {
   const answer = ui.alert(
     'Rotate app token?',
     'Both phones stop syncing until you reconnect them with the new link. Continue?',
-    ui.ButtonSet.YES_NO,
+    ui.ButtonSet.YES_NO
   );
   if (answer !== ui.Button.YES) return;
   PropertiesService.getScriptProperties().setProperty(DICED_TOKEN_KEY, newToken_());
   showConnectionInfo();
 }
 
+/**
+ * Called from the connection dialog (google.script.run) when the user pastes the
+ * /exec URL, because getUrl() can keep returning the /dev URL for versioned
+ * deployments.
+ */
+function saveWebAppUrl(url) {
+  if (!isExecUrl_(url)) throw new Error('Expected the web app URL ending in /exec');
+  PropertiesService.getScriptProperties().setProperty(DICED_URL_KEY, url);
+  return true;
+}
+
+function isExecUrl_(url) {
+  return typeof url === 'string' && /^https:\/\/\S+\/exec$/.test(url);
+}
+
+/** The deployed /exec URL if known, else whatever getUrl() says (a /dev URL or ''). */
 function webAppUrl_() {
+  let url = '';
   try {
-    return ScriptApp.getService().getUrl() || '';
+    url = ScriptApp.getService().getUrl() || '';
   } catch (err) {
-    return '';
+    url = '';
   }
+  if (isExecUrl_(url)) return url;
+  return PropertiesService.getScriptProperties().getProperty(DICED_URL_KEY) || url;
 }
 
 function connectLink_(url, token) {
@@ -212,7 +234,7 @@ function escapeHtml_(s) {
  * never leaves the dialog.
  */
 function connectionInfoHtml_(url, token, setUp) {
-  const deployed = /\/exec$/.test(url);
+  const deployed = isExecUrl_(url);
   const initialUrl = deployed ? url : '';
   const link = initialUrl ? connectLink_(initialUrl, token) : '';
   const warnings = [];
@@ -226,7 +248,7 @@ function connectionInfoHtml_(url, token, setUp) {
     warnings.push('This is the test URL (ending in /dev), which phones cannot use. Copy the Web app URL ' +
       'ending in <b>/exec</b> from <b>Deploy → Manage deployments</b> and paste it below.');
   }
-  const data = JSON.stringify({ token: token }).replace(/</g, '\\u003c');
+  const data = JSON.stringify({ token: token, saved: initialUrl }).replace(/</g, '\\u003c');
   return [
     '<!doctype html><html><head><base target="_blank">',
     '<style>',
@@ -260,6 +282,7 @@ function connectionInfoHtml_(url, token, setUp) {
     ' if(!/^https:\\/\\/\\S+\\/exec$/.test(url)){a.removeAttribute("href");a.textContent="(paste the web app URL ending in /exec)";return;}',
     ' var link="diced://connect?url="+encodeURIComponent(url)+"&token="+encodeURIComponent(DICED.token);',
     ' a.href=link;a.textContent=link;',
+    ' if(url!==DICED.saved&&window.google&&google.script){DICED.saved=url;google.script.run.withFailureHandler(function(){}).saveWebAppUrl(url);}',
     ' try{new QRCode(qr,{text:link,width:220,height:220,correctLevel:QRCode.CorrectLevel.M});}',
     ' catch(e){qr.textContent="QR code unavailable — open the link on the phone instead.";}',
     '}',
@@ -333,8 +356,8 @@ function styleHeader_(range, background) {
 
 function styleGroup_(range, text, background) {
   range.breakApart().merge();
-  range.setValue(text)
-    .setBackground(background)
+  range.getCell(1, 1).setValue(text);
+  range.setBackground(background)
     .setFontWeight('bold')
     .setFontSize(11)
     .setFontColor('#ffffff')
@@ -416,9 +439,12 @@ function dailyColumns_() {
       { col: p.daily.protein, header: L + ' protein (g)', format: '0', width: 80,
         formula: function (r) { return '=IF(' + foodCount_(r, L) + '=0,"",' + foodSum_(r, L, 'G') + ')'; } },
       { col: p.daily.target, header: L + ' calorie target', format: '#,##0', width: 85,
-        formula: function (r) { return DICED_TARGET_FORMULAS[L](r, p); } },
+        formula: function (r) {
+          const rule = DICED_TARGET_FORMULAS[L];
+          return rule ? rule(r, p) : '';
+        } },
       { col: p.daily.meals, header: L + ' meals logged', format: '0', width: 75,
-        formula: function (r) { return '=IF(' + foodCount_(r, L) + '=0,"",' + foodCount_(r, L) + ')'; } },
+        formula: function (r) { return '=IF(' + foodCount_(r, L) + '=0,"",' + foodCount_(r, L) + ')'; } }
     );
   });
   return cols;
@@ -452,7 +478,7 @@ function weeklyColumns_() {
           const prev = checkin + (r - 1);
           return '=IF(OR($P' + r + '=1,$' + w.days + r + '<4,N(' + now + ')=0,N(' + prev + ')=0),"",ROUND($' +
             w.kcal + r + '-(' + now + '-' + prev + ')*3500/7,-1))';
-        } },
+        } }
     );
   });
   return cols;
@@ -464,9 +490,8 @@ function ensureDailyLog_(ss) {
   const sheet = ensureSheet_(ss, DICED_SHEETS.dailyLog, checkin ? checkin.getIndex() : ss.getNumSheets());
   const daily = dailyColumns_();
   const weekly = weeklyColumns_();
-  const lastCol = Math.max.apply(null, daily.concat(weekly).map(function (c) { return colIndex_(c.col); }));
+  const lastCol = dailyLogWidth_();
   const lastRow = lastDailyRow_();
-  const lastWeek = lastWeekRow_();
   ensureColumns_(sheet, lastCol);
   ensureRows_(sheet, lastRow);
   writeTitle_(sheet, 'DAILY LOG', DICED_DAILY_NOTE);
@@ -505,6 +530,11 @@ function ensureDailyLog_(ss) {
   const lastDailyCol = Math.max.apply(null, daily.map(function (c) { return colIndex_(c.col); }));
   ensureTodayRule_(sheet, sheet.getRange(DICED_FIRST_ROW, 1, DICED_PLAN_DAYS, lastDailyCol));
   return sheet;
+}
+
+/** Rightmost Daily Log column used by any person (X with the default config). */
+function dailyLogWidth_() {
+  return Math.max.apply(null, dailyColumns_().concat(weeklyColumns_()).map(function (c) { return colIndex_(c.col); }));
 }
 
 function writeFormulaColumns_(sheet, columns, rows) {
@@ -649,21 +679,31 @@ function rewireGamePlan_(ss) {
   for (let i = header + 1; i < values.length && String(values[i][0]).trim() !== ''; i++) {
     last = i;
     const label = String(values[i][0]).trim();
-    if (label === DICED_SHEETS.checkin) sheet.getRange(i + 1, 3).setValue(DICED_GAMEPLAN_CHECKIN);
+    if (label === DICED_SHEETS.checkin) {
+      sheet.getRange(i + 1, 3).setValue(DICED_GAMEPLAN_CHECKIN);
+      ensureRowHeight_(sheet, i + 1, DICED_GAMEPLAN_ROW_PX);
+    }
     if (label === DICED_SHEETS.dailyLog) hasDaily = true;
   }
   if (hasDaily || last === header) return;
   const lastRow = last + 1;
   const target = lastRow + 1;
-  const width = Math.max(sheet.getLastColumn() - 1, 2); // columns B..last used
-  const next = target <= sheet.getMaxRows() ? sheet.getRange(target, 2, 1, width).getValues()[0] : [];
+  const width = sheet.getMaxColumns();
+  const next = target <= sheet.getMaxRows() ? sheet.getRange(target, 1, 1, width).getValues()[0] : [];
   if (next.some(function (v) { return v !== '' && v !== null; })) sheet.insertRowAfter(lastRow);
   ensureRows_(sheet, target);
-  sheet.getRange(lastRow, 2, 1, width)
-    .copyTo(sheet.getRange(target, 2, 1, width), SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+  // Whole-row copy so the C:F merge and fonts of the row above come along.
+  sheet.getRange(lastRow, 1, 1, width)
+    .copyTo(sheet.getRange(target, 1, 1, width), SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
   sheet.setRowHeight(target, sheet.getRowHeight(lastRow));
+  ensureRowHeight_(sheet, target, DICED_GAMEPLAN_ROW_PX);
   sheet.getRange(target, 2).setValue(DICED_SHEETS.dailyLog);
   sheet.getRange(target, 3).setValue(DICED_GAMEPLAN_DAILY);
+}
+
+/** Rows with explicit heights don't grow with wrapped text, so make room for ~3 lines. */
+function ensureRowHeight_(sheet, row, px) {
+  if (sheet.getRowHeight(row) < px) sheet.setRowHeight(row, px);
 }
 
 // ── Token ──
@@ -849,7 +889,8 @@ function actionUpsertLibrary_(ctx, payload) {
       carbsG: requireNumber_(raw, 'carbsG', 0, 2000),
       fatG: requireNumber_(raw, 'fatG', 0, 2000),
       aliases: requireAliases_(raw, 'aliases'),
-      addedBy: requirePerson_(raw, 'addedBy'),
+      // Hand-typed library rows may leave Added by blank; the phones send that blank back.
+      addedBy: optionalPerson_(raw, 'addedBy'),
       uses: requireInteger_(raw, 'uses', 0, 1000000),
       updatedAt: optionalTimestamp_(raw, 'updatedAt'),
     };
@@ -889,20 +930,19 @@ function actionGetSummary_(ctx, payload) {
   const p = DICED_CONFIG.people.filter(function (x) { return x.label === person; })[0];
   const daily = requireSheet_(ctx.ss, DICED_SHEETS.dailyLog);
   const checkin = requireSheet_(ctx.ss, DICED_SHEETS.checkin);
-  const lastCol = colIndex_('X');
-  const grid = daily.getRange(DICED_FIRST_ROW, 1, DICED_PLAN_DAYS, lastCol).getValues();
+  const grid = daily.getRange(DICED_FIRST_ROW, 1, DICED_PLAN_DAYS, dailyLogWidth_()).getValues();
   const checkinGrid = checkin
     .getRange(DICED_FIRST_ROW, 1, DICED_PLAN_WEEKS, Math.max(colIndex_(p.checkinWeightCol), 2))
     .getValues();
   const at = function (row, col) { return row[colIndex_(col) - 1]; };
 
   const days = [];
-  grid.forEach(function (row) {
+  grid.forEach(function (row, i) {
     const date = ymdOrEmpty_(row[0], ctx.tz);
     if (!date || date < from || date > to) return;
     days.push({
       date: date,
-      week: numberOrNull_(row[1]),
+      week: numberOrNull_(row[1]) || Math.floor(i / 7) + 1,
       weightLb: numberOrNull_(at(row, p.daily.weight)),
       kcal: numberOrNull_(at(row, p.daily.kcal)),
       proteinG: numberOrNull_(at(row, p.daily.protein)),
@@ -916,7 +956,7 @@ function actionGetSummary_(ctx, payload) {
     const c = checkinGrid[i];
     return {
       week: numberOrNull_(at(row, 'P')) || i + 1,
-      monday: ymdOrEmpty_(c[1], ctx.tz),
+      monday: ymdOrEmpty_(c[1], ctx.tz) || ymdOrEmpty_(grid[i * 7][0], ctx.tz),
       avgWeightLb: numberOrNull_(c[weightCol - 1]),
       targetWeightLb: numberOrNull_(c[weightCol - 2]),
       avgKcal: numberOrNull_(at(row, p.weekly.kcal)),
@@ -1046,35 +1086,41 @@ function upsertInto_(ctx, tab, records, stampLoggedAt) {
 
 /**
  * Overwrites rows whose Entry ID matches in place; appends the rest after the last
- * row with data in column A. Duplicate IDs within one batch update the earlier row.
+ * row with data in column A (or with an Entry ID, so such a row is never clobbered).
+ * Duplicate IDs within one batch collapse into one row holding the last values.
  */
 function upsertRows_(sheet, tab, records) {
+  const has = function (obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); };
   const width = tab.columns.length;
-  const index = {};
+  const existing = {};
+  let lastUsed = lastRowWithDate_(sheet);
   readIds_(sheet, tab).forEach(function (id, i) {
-    if (id !== '' && !Object.prototype.hasOwnProperty.call(index, id)) index[id] = DICED_FIRST_ROW + i;
+    if (id === '') return;
+    if (!has(existing, id)) existing[id] = DICED_FIRST_ROW + i;
+    lastUsed = Math.max(lastUsed, DICED_FIRST_ROW + i);
   });
-  const appendAt = lastRowWithDate_(sheet) + 1;
+  const pending = {};
   const appends = [];
   let inserted = 0;
   let updated = 0;
   records.forEach(function (record) {
     const values = toRow_(tab, record);
     const id = record.entryId;
-    if (Object.prototype.hasOwnProperty.call(index, id)) {
-      const row = index[id];
-      if (row >= appendAt && row - appendAt < appends.length) appends[row - appendAt] = values;
-      else sheet.getRange(row, 1, 1, width).setValues([values]);
+    if (has(existing, id)) {
+      sheet.getRange(existing[id], 1, 1, width).setValues([values]);
+      updated++;
+    } else if (has(pending, id)) {
+      appends[pending[id]] = values;
       updated++;
     } else {
-      index[id] = appendAt + appends.length;
+      pending[id] = appends.length;
       appends.push(values);
       inserted++;
     }
   });
   if (appends.length) {
-    ensureRows_(sheet, appendAt + appends.length - 1);
-    sheet.getRange(appendAt, 1, appends.length, width).setValues(appends);
+    ensureRows_(sheet, lastUsed + appends.length);
+    sheet.getRange(lastUsed + 1, 1, appends.length, width).setValues(appends);
   }
   return { inserted: inserted, updated: updated };
 }
@@ -1164,6 +1210,13 @@ function requirePerson_(obj, key) {
     throw invalid_('unknown ' + key + ' "' + String(v) + '" (expected ' + labels.join(' or ') + ')');
   }
   return v;
+}
+
+/** A person label, or '' (blank / missing) — never an unknown name. */
+function optionalPerson_(obj, key) {
+  const v = obj[key];
+  if (v === undefined || v === null || v === '') return '';
+  return requirePerson_(obj, key);
 }
 
 function requireNumber_(obj, key, min, max) {

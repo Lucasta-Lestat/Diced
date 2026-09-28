@@ -116,9 +116,10 @@ calls use limited concurrency (≤3) and respect the time budget / abort signal.
 
 | Route | Purpose |
 |---|---|
-| `_layout.tsx` | Stack. At module scope: `defineBackgroundTask()`. On mount: `getDb()`, `configureNotifications()`, register background task, listen for notification links, redirect to `/onboarding` until `onboardingComplete`; on foreground: run processing if weekly/daily run is due (cloud mode + configured) and sync approved entries. |
+| *(entry)* `mobile/index.ts` | Custom entry: imports `src/scheduling/defineTasks.ts` (calls `defineBackgroundTask()` in the global scope — a headless background launch mounts no views, so route files never run) and then `expo-router/entry`. |
+| `_layout.tsx` | Stack. On mount: `getDb()`, `configureNotifications()`, register background task, listen for notification links, redirect to `/onboarding` until `onboardingComplete`; on foreground: run processing if weekly/daily run is due (cloud mode + configured) and sync approved entries. |
 | `index.tsx` (Home) | Person + sheet status; this week's weigh-ins (from local entries + cached summary: 7-day avg vs target); today's calories vs target; buttons: *Process new photos*, *Review (N)*, *Quick log*; last run summary. |
-| `review/index.tsx` | Queue grouped by day: weight cards (value, flags, candidate thumbnails) and meal cards (thumbnail, title, kcal ± range, P/C/F, confidence, questions badge). *Approve all confident*, per-card approve/reject; *Sync now*. |
+| `review/index.tsx` | Queue grouped by day: weight cards (value, flags, candidate thumbnails) and meal cards (thumbnail, title, kcal ± range, P/C/F, confidence, questions badge). *Approve all confident*, per-card approve/reject; *Sync now*. Approve / reject / manual entries (and edits of synced entries) push to the sheet ~3 s after the last decision (`requestSync` in `src/ui/autoRun.ts`, debounced, best-effort). |
 | `review/meal/[id].tsx` | Photos, items with editable grams, totals (editable), clarifying questions as chips, notes, *Re-estimate*, *Save as usual meal*, merge with previous meal, slot/time, approve/reject. |
 | `review/weight/[id].tsx` | Photo(s), pick candidate, edit value, notes, approve/reject. |
 | `capture.tsx` | Quick log: take a photo of the scale or a meal (expo-image-picker camera) or pick from the library, or type a manual weight/meal. |

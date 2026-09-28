@@ -22,6 +22,8 @@ interface NodeDatabase {
   prepare(sql: string): NodeStatement;
   close(): void;
 }
+// Typed locally instead of importing @types/node, so Node globals don't leak into the app's type-check.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 const { DatabaseSync } = require('node:sqlite') as { DatabaseSync: new (path: string) => NodeDatabase };
 
 type BindArgs = unknown[];

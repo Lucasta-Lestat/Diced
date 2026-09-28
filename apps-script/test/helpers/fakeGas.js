@@ -98,6 +98,11 @@ class FakeRange {
   getNumColumns() { return this.numCols; }
   getLastRow() { return this.row + this.numRows - 1; }
   getLastColumn() { return this.col + this.numCols - 1; }
+  getCell(r, c) {
+    if (r > this.numRows || c > this.numCols) throw new Error('Cell reference out of range');
+    return new FakeRange(this.sheet, this.row + r - 1, this.col + c - 1, 1, 1);
+  }
+
   getA1Notation() {
     const a = colLetter(this.col) + this.row;
     const b = colLetter(this.getLastColumn()) + this.getLastRow();
@@ -398,7 +403,7 @@ class FakeSheet {
   setRowHeight(row, px) { this.rowHeights[row] = px; return this; }
   getRowHeight(row) { return this.rowHeights[row] || 21; }
   getConditionalFormatRules() { return this.cfRules.slice(); }
-  setConditionalFormatRules(rules) { this.cfRules = rules.slice(); }
+  setConditionalFormatRules(rules) { this.cfRules = Array.from(rules); }
 }
 
 class FakeSpreadsheet {
@@ -447,12 +452,12 @@ function newDataValidation() {
   const rule = { type: null, values: null, showDropdown: true, allowInvalid: true };
   const builder = {
     requireValueInList(values, showDropdown) {
-      Object.assign(rule, { type: 'list', values: values.slice(), showDropdown: showDropdown !== false });
+      Object.assign(rule, { type: 'list', values: Array.from(values), showDropdown: showDropdown !== false });
       return builder;
     },
     setAllowInvalid(v) { rule.allowInvalid = v; return builder; },
     setHelpText(v) { rule.helpText = v; return builder; },
-    build() { return { ...rule, values: rule.values && rule.values.slice() }; },
+    build() { return { ...rule, values: rule.values && Array.from(rule.values) }; },
   };
   return builder;
 }
@@ -474,7 +479,7 @@ function newConditionalFormatRule() {
   const builder = {
     whenFormulaSatisfied(f) { spec.formula = f; return builder; },
     setBackground(c) { spec.background = c; return builder; },
-    setRanges(ranges) { spec.ranges = ranges.slice(); return builder; },
+    setRanges(ranges) { spec.ranges = Array.from(ranges); return builder; },
     build() { return makeRule(spec); },
   };
   return builder;
@@ -596,6 +601,8 @@ function loadCode(ss, options = {}) {
     /** Evaluates an expression inside Code.gs's global scope (reaches top-level consts). */
     get: (expr) => vm.runInContext(expr, context),
     call: (fn, ...args) => context[fn](...args),
+    /** Like call, but JSON-normalised so results compare with deepEqual across realms. */
+    callPlain: (fn, ...args) => JSON.parse(JSON.stringify(context[fn](...args))),
     post(body) {
       const raw = typeof body === 'string' ? body : JSON.stringify(body);
       const out = context.doPost({ postData: { contents: raw, type: 'text/plain' } });

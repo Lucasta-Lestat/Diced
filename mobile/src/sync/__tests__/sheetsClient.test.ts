@@ -1,6 +1,5 @@
 /// <reference types="jest" />
-import { getSecret, getSettings } from '../../config/settings';
-import { DEFAULT_SETTINGS } from '../../config/settings';
+import { DEFAULT_SETTINGS, getSecret, getSettings } from '../../config/settings';
 import { kvGet, kvSet } from '../../db/database';
 import type { PingData } from '../contract';
 import {

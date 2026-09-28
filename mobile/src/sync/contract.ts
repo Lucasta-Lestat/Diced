@@ -45,6 +45,7 @@ export interface SheetLibraryItem {
   carbsG: number;
   fatG: number;
   aliases: string[];
+  /** Person label, or '' when a hand-typed sheet row left Added by blank. */
   addedBy: string;
   uses: number;
   /** ISO timestamp */

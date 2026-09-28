@@ -1,6 +1,9 @@
 /** Read a bathroom-scale display from a photo. OWNER: AI builder. */
 import type { Confidence, WeightUnit } from '../types';
 import type { PreparedImage } from '../photos/images';
+import { SCALE_SYSTEM, scaleUserText } from './prompts';
+import { type AiCallOptions, structuredCall, userContent } from './request';
+import { ScaleSchema, toScaleReading } from './schemas';
 
 export interface ScaleReading {
   /** false when the photo does not actually show a readable scale display. */
@@ -20,10 +23,24 @@ export interface ScaleReading {
 export async function readScale(
   image: PreparedImage,
   opts: { expectedUnit: WeightUnit; recentLb: number | null },
+  callOpts: AiCallOptions = {},
 ): Promise<ScaleReading> {
-  throw new Error('not implemented');
+  const { data } = await structuredCall(
+    {
+      task: 'read the scale',
+      schema: ScaleSchema,
+      system: SCALE_SYSTEM,
+      content: userContent([{ image }], scaleUserText(opts)),
+      effort: 'medium',
+    },
+    callOpts,
+  );
+  return toScaleReading(data, opts.expectedUnit);
 }
 
+const LB_PER_KG = 2.20462;
+
 export function toPounds(value: number, unit: WeightUnit): number {
-  throw new Error('not implemented');
+  const lb = unit === 'kg' ? value * LB_PER_KG : value;
+  return Math.round(lb * 10) / 10;
 }

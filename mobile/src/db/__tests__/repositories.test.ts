@@ -47,6 +47,8 @@ import {
   upsertWeightEntry,
 } from '../weights';
 
+// jest.mock factories are hoisted above imports, so the adapter has to be required inside.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 jest.mock('expo-sqlite', () => require('../testing/nodeSqlite').expoSqliteMock());
 
 const NOW = 1_800_000_000_000;

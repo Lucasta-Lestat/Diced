@@ -1,0 +1,56 @@
+{
+ "nutella": {
+  "code": "3017624010701",
+  "product": {
+   "brands": "Ferrero",
+   "code": "3017624010701",
+   "nutriments": {
+    "carbohydrates_100g": 57.5,
+    "energy-kcal_100g": 539,
+    "energy-kcal_unit": "kcal",
+    "energy_100g": 2227.9,
+    "energy_unit": "kJ",
+    "fat_100g": 30.9,
+    "proteins_100g": 6.3
+   },
+   "nutrition_data": "on",
+   "nutrition_data_per": "100g",
+   "nutrition_data_prepared_per": "100g",
+   "product_name": "Nutella"
+  },
+  "status": 1,
+  "status_verbose": "product found"
+ },
+ "coke": {
+  "code": "5449000000996",
+  "product": {
+   "brands": "COCA-COLA SERVICES SA/NV",
+   "code": "5449000000996",
+   "nutriments": {
+    "carbohydrates_100g": 10.6,
+    "carbohydrates_serving": 35,
+    "energy-kcal_100g": 42,
+    "energy-kcal_serving": 139,
+    "energy-kcal_unit": "kcal",
+    "energy_100g": 180,
+    "energy_serving": 594,
+    "energy_unit": "kJ",
+    "fat_100g": 0,
+    "fat_serving": 0,
+    "proteins_100g": 0,
+    "proteins_serving": 0
+   },
+   "nutrition_data": "on",
+   "nutrition_data_prepared_per": "100g",
+   "product_name": "Coca-Cola Original",
+   "serving_quantity": 330
+  },
+  "status": 1,
+  "status_verbose": "product found"
+ },
+ "notFound": {
+  "status": 0,
+  "status_verbose": "product not found",
+  "code": "96385074"
+ }
+}

@@ -105,7 +105,7 @@ it; edit freely — the Daily Log recalculates.`
 | E | Carbs (g) |
 | F | Fat (g) |
 | G | Aliases (comma-separated) |
-| H | Added by (`Her`/`Him`) |
+| H | Added by (`Her`/`Him`, or blank on hand-typed rows) |
 | I | Uses |
 | J | Updated at |
 | K | Entry ID |
@@ -278,7 +278,10 @@ Semantics:
 * `getSummary` reads **computed values** from `Daily Log` (`days`, filtered to
   `from..to`) and from `Weekly Check-in` (`D`/`J` target weight, `E`/`K` average) plus
   the Daily Log weekly block (`weeks`, all 22). Empty strings become `null`.
-* `listLibrary` returns all rows with a non-empty Name.
+* `listLibrary` returns all rows with a non-empty Name. Hand-typed rows with a blank
+  Entry ID are given one (a UUID written back to the sheet) so the phones can update them.
+* `upsertLibrary`: `addedBy` must be a person label **or `''`** (hand-typed rows may leave
+  Added by blank, and a phone sends that blank back when it bumps `uses`).
 
 ## Custom menu
 

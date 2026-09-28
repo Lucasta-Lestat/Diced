@@ -4,7 +4,59 @@
  * → reconcile → store entries as needs_review → notify. Resumable: every step persists
  * per-photo state, so a run cut short by the time budget continues next time.
  */
-import type { ProcessProgress, ProcessResult, RunReason } from '../types';
+import { Directory, File, Paths } from 'expo-file-system';
+import { classifyBatch, type ClassifyInput } from '../ai/classify';
+import { AiApiError, AiNotConfiguredError } from '../ai/client';
+import { readScale, toPounds, type ScaleReading } from '../ai/scale';
+import { getSettings, updateSettings } from '../config/settings';
+import { chunk } from '../db/database';
+import { listLibrary } from '../db/library';
+import { listMeals, upsertMeal } from '../db/meals';
+import {
+  getPhotos,
+  insertNewPhotos,
+  listUnclassified,
+  listUnprocessed,
+  markProcessed,
+  setClassification,
+  setPhotoError,
+} from '../db/photos';
+import { recordRun } from '../db/runs';
+import { listWeightEntries, recentAcceptedWeights, upsertWeightEntry } from '../db/weights';
+import { formatDayLabel, toLocalDate, toLocalTime } from '../lib/dates';
+import { newId, weightEntryId } from '../lib/ids';
+import { errorMessage, logger } from '../lib/log';
+import { groupMealPhotos, guessMealSlot } from '../nutrition/grouping';
+import { makeThumbnail, prepareForModel } from '../photos/images';
+import { listPhotosInRange, resolveReadableUri } from '../photos/scanner';
+import { nextScanWindow, shiftLocalDays } from '../scheduling/due';
+import { notifyReviewReady } from '../scheduling/notifications';
+import type {
+  AppSettings,
+  EntryStatus,
+  LibraryItem,
+  PersonLabel,
+  PhotoCategory,
+  PhotoRecord,
+  ProcessProgress,
+  ProcessResult,
+  RunReason,
+  WeightCandidate,
+  WeightEntry,
+  WeightUnit,
+} from '../types';
+import { mapLimit, withWeightLock } from './concurrency';
+import { estimateAndReconcile, isEmptyEstimate, loadMealImages, newMealEntry } from './mealEstimate';
+import {
+  hasPresetCategory,
+  modelConfidence,
+  nextLastScanEnd,
+  photoRecordFromAsset,
+  PRESET_CATEGORY_CONFIDENCE,
+  presetPhotoRecord,
+  RETRY_LOOKBACK_DAYS,
+} from './records';
+import { attachCandidates, buildWeightEntries, CAPTURE_ASSET_PREFIX } from './weights';
 
 export interface ProcessOptions {
   reason: RunReason;
@@ -17,14 +69,621 @@ export interface ProcessOptions {
   signal?: AbortSignal;
 }
 
-/** Single-flight: a second call while running returns the in-progress promise. */
-export async function processPhotos(opts: ProcessOptions): Promise<ProcessResult> {
-  throw new Error('not implemented');
+export const CLASSIFY_BATCH_SIZE = 16;
+export const CLASSIFY_CONCURRENCY = 2;
+/** Scale readings / meal estimates in flight at once. */
+export const AI_CONCURRENCY = 3;
+const THUMBNAIL_CONCURRENCY = 4;
+const MAX_RUN_ERRORS = 25;
+/** History used for the weigh-in trend check and to disambiguate scale digits. */
+const RECENT_WEIGHT_DAYS = 30;
+const CAPTURE_DIR = 'captures';
+const PHOTO_GONE = 'Photo no longer available';
+const AUTOMATIC_REASONS: readonly RunReason[] = ['weekly', 'daily', 'background'];
+const LIVE_MEAL_STATUSES: EntryStatus[] = ['needs_review', 'approved', 'synced', 'sync_error'];
+/** After these, every further Claude call would fail the same way, so the run stops starting new ones. */
+const RUN_STOPPING_KINDS = new Set(['auth', 'permission', 'not_found', 'rate_limit', 'overloaded', 'network', 'aborted']);
+
+const log = logger('pipeline');
+
+// ---------------------------------------------------------------------------
+// Module state: single-flight run + photos claimed by whichever job is working on them
+// ---------------------------------------------------------------------------
+
+let inFlight: Promise<ProcessResult> | null = null;
+let sideJobs = 0;
+/**
+ * Quick-log captures and hand-picked photos run alongside a scheduled run; claiming makes sure
+ * no photo is read or estimated twice (which would create a duplicate meal).
+ */
+const claimed = new Set<string>();
+
+function claim<T extends { assetId: string }>(items: T[]): T[] {
+  const mine = items.filter((p) => !claimed.has(p.assetId));
+  for (const p of mine) claimed.add(p.assetId);
+  return mine;
 }
 
-/** True while a run is in progress. */
+function release(items: { assetId: string }[]): void {
+  for (const p of items) claimed.delete(p.assetId);
+}
+
+async function sideJob<T>(task: () => Promise<T>): Promise<T> {
+  sideJobs++;
+  try {
+    return await task();
+  } finally {
+    sideJobs--;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Run context
+// ---------------------------------------------------------------------------
+
+class RunContext {
+  readonly result: ProcessResult;
+  /** A run-stopping AI error happened (no key, rate limit, offline…). */
+  halted = false;
+
+  constructor(
+    readonly settings: AppSettings,
+    readonly person: PersonLabel,
+    reason: RunReason,
+    window: { startMs: number; endMs: number },
+    private readonly deadline: number,
+    readonly signal?: AbortSignal,
+    private readonly onProgress?: (p: ProcessProgress) => void,
+  ) {
+    this.result = {
+      reason,
+      windowStart: window.startMs,
+      windowEnd: window.endMs,
+      photosScanned: 0,
+      photosExcluded: 0,
+      photosClassified: 0,
+      scalePhotos: 0,
+      foodPhotos: 0,
+      weightEntriesCreated: 0,
+      mealsCreated: 0,
+      errors: [],
+      partial: false,
+    };
+  }
+
+  shouldStop(): boolean {
+    return this.halted || this.signal?.aborted === true || Date.now() >= this.deadline;
+  }
+
+  /** True (and the result marked partial) when no new work may start. */
+  stopHere(): boolean {
+    if (!this.shouldStop()) return false;
+    this.result.partial = true;
+    return true;
+  }
+
+  progress(stage: ProcessProgress['stage'], done: number, total: number, message: string): void {
+    try {
+      this.onProgress?.({ stage, done, total, message });
+    } catch (e) {
+      log.warn(`progress listener threw: ${errorMessage(e)}`);
+    }
+  }
+
+  addError(message: string): void {
+    const { errors } = this.result;
+    if (errors.length < MAX_RUN_ERRORS && !errors.includes(message)) errors.push(message);
+  }
+
+  aiFailed(e: unknown): void {
+    if (!isRunStopping(e)) return;
+    this.halted = true;
+    this.result.partial = true;
+  }
+}
+
+function isCancelled(e: unknown): boolean {
+  return e instanceof AiApiError && e.kind === 'aborted';
+}
+
+function isRunStopping(e: unknown): boolean {
+  if (e instanceof AiNotConfiguredError) return true;
+  return e instanceof AiApiError && RUN_STOPPING_KINDS.has(e.kind);
+}
+
+function requirePerson(settings: AppSettings): PersonLabel {
+  if (!settings.person) {
+    throw new Error('Choose who this phone logs for (Her or Him) in Settings before processing photos.');
+  }
+  return settings.person;
+}
+
+function describePhoto(record: { creationTime: number }): string {
+  return `Photo from ${formatDayLabel(toLocalDate(record.creationTime))} ${toLocalTime(record.creationTime)}`;
+}
+
+async function setPhotoErrorQuietly(assetId: string, message: string): Promise<void> {
+  try {
+    await setPhotoError(assetId, message);
+  } catch (e) {
+    log.warn(`could not store photo error: ${errorMessage(e)}`);
+  }
+}
+
+async function photoFailed(ctx: RunContext, record: PhotoRecord, e: unknown): Promise<void> {
+  // Cancelled by the run itself (abort signal): not the photo's fault, just unfinished.
+  if (isCancelled(e)) return ctx.aiFailed(e);
+  const message = errorMessage(e);
+  await setPhotoErrorQuietly(record.assetId, message);
+  ctx.addError(`${describePhoto(record)}: ${message}`);
+  ctx.aiFailed(e);
+}
+
+/** Includes up to 35 days before the window so failed / unfinished photos are retried. */
+function retryRange(window: { startMs: number; endMs: number }): { startMs: number; endMs: number } {
+  return { startMs: Math.min(window.startMs, shiftLocalDays(window.endMs, -RETRY_LOOKBACK_DAYS)), endMs: window.endMs };
+}
+
+// ---------------------------------------------------------------------------
+// Stage 1: scan
+// ---------------------------------------------------------------------------
+
+async function scanStage(ctx: RunContext, window: { startMs: number; endMs: number }): Promise<void> {
+  ctx.progress('scanning', 0, 0, 'Looking for new photos…');
+  try {
+    const assets = await listPhotosInRange(window.startMs, window.endMs);
+    const now = Date.now();
+    const records = assets.map((a) => photoRecordFromAsset(a, now));
+    await insertNewPhotos(records);
+    ctx.result.photosScanned = records.length;
+    ctx.result.photosExcluded = records.filter((r) => r.excludedReason !== null).length;
+    ctx.progress('scanning', records.length, records.length, `Found ${records.length} photos`);
+  } catch (e) {
+    // Photos already known are still processed; the window is rescanned next time.
+    ctx.addError(`Couldn't read the photo library: ${errorMessage(e)}`);
+    ctx.result.partial = true;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: classify thumbnails
+// ---------------------------------------------------------------------------
+
+async function thumbnailFailed(ctx: RunContext, record: PhotoRecord, e: unknown): Promise<void> {
+  let exists = true;
+  try {
+    exists = (await resolveReadableUri(record.assetId, record.uri)) !== null;
+  } catch {
+    // Unknown: keep it for a retry.
+  }
+  if (!exists) {
+    // Deleted since the scan: classify as "other" so it is not retried every run.
+    await setClassification(record.assetId, 'other', 0);
+    await setPhotoErrorQuietly(record.assetId, PHOTO_GONE);
+    return;
+  }
+  await photoFailed(ctx, record, e);
+}
+
+async function classifyOneBatch(ctx: RunContext, batch: PhotoRecord[]): Promise<void> {
+  const thumbs: (ClassifyInput | null)[] = batch.map(() => null);
+  await mapLimit(batch, THUMBNAIL_CONCURRENCY, async (record, i) => {
+    try {
+      thumbs[i] = { assetId: record.assetId, image: await makeThumbnail(record.uri) };
+    } catch (e) {
+      await thumbnailFailed(ctx, record, e);
+    }
+  });
+  const inputs = thumbs.filter((t): t is ClassifyInput => t !== null);
+  if (inputs.length === 0) return;
+
+  let output: Awaited<ReturnType<typeof classifyBatch>>;
+  try {
+    output = await classifyBatch(inputs, { signal: ctx.signal });
+  } catch (e) {
+    if (isCancelled(e)) return ctx.aiFailed(e);
+    const message = errorMessage(e);
+    for (const input of inputs) await setPhotoErrorQuietly(input.assetId, message);
+    ctx.addError(`Couldn't sort ${inputs.length} photos: ${message}`);
+    ctx.aiFailed(e);
+    return;
+  }
+  for (const input of inputs) {
+    const c = output[input.assetId] ?? { category: 'other' as PhotoCategory, confidence: 0 };
+    await setClassification(input.assetId, c.category, modelConfidence(c.confidence));
+    ctx.result.photosClassified++;
+  }
+}
+
+/** Returns true when every unclassified photo got a classification attempt. */
+async function classifyStage(ctx: RunContext, range: { startMs: number; endMs: number }): Promise<boolean> {
+  const records = claim(await listUnclassified(range.startMs, range.endMs));
+  try {
+    const batches = chunk(records, CLASSIFY_BATCH_SIZE);
+    let done = 0;
+    ctx.progress('classifying', 0, records.length, `Sorting ${records.length} photos…`);
+    const started = await mapLimit(
+      batches,
+      CLASSIFY_CONCURRENCY,
+      async (batch) => {
+        await classifyOneBatch(ctx, batch);
+        done += batch.length;
+        ctx.progress('classifying', done, records.length, `Sorted ${done} of ${records.length} photos`);
+      },
+      () => ctx.shouldStop(),
+    );
+    const complete = started === batches.length && !ctx.halted;
+    if (!complete) ctx.result.partial = true;
+    return complete;
+  } finally {
+    release(records);
+  }
+}
+
+async function pendingPhotos(
+  range: { startMs: number; endMs: number },
+  categories: PhotoCategory[],
+  cloud: boolean,
+): Promise<PhotoRecord[]> {
+  const records = await listUnprocessed(range.startMs, range.endMs, categories);
+  // Manual mode never sends a photo the user didn't choose.
+  return claim(cloud ? records : records.filter(hasPresetCategory));
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3: scale photos → weigh-ins
+// ---------------------------------------------------------------------------
+
+/** Pure: a model reading as a weigh-in candidate, or null when no weight was read. */
+export function readingToCandidate(
+  record: { assetId: string; creationTime: number },
+  reading: ScaleReading,
+  fallbackUnit: WeightUnit,
+): WeightCandidate | null {
+  if (!reading.isScale || reading.value === null || !Number.isFinite(reading.value) || reading.value <= 0) return null;
+  const unit = reading.unit ?? fallbackUnit;
+  return {
+    assetId: record.assetId,
+    takenAt: record.creationTime,
+    valueLb: Math.round(toPounds(reading.value, unit) * 10) / 10,
+    rawValue: reading.value,
+    rawUnit: unit,
+    readConfidence: reading.confidence,
+  };
+}
+
+type ScaleOutcome = { kind: 'reading'; candidate: WeightCandidate } | { kind: 'unreadable' } | { kind: 'gone' };
+
+async function readScalePhoto(
+  settings: AppSettings,
+  record: PhotoRecord,
+  recentLb: number | null,
+  signal?: AbortSignal,
+): Promise<ScaleOutcome> {
+  const uri = await resolveReadableUri(record.assetId, record.uri);
+  if (!uri) return { kind: 'gone' };
+  const image = await prepareForModel(uri);
+  const reading = await readScale(image, { expectedUnit: settings.scaleUnit, recentLb }, { signal });
+  const candidate = readingToCandidate(record, reading, settings.scaleUnit);
+  return candidate ? { kind: 'reading', candidate } : { kind: 'unreadable' };
+}
+
+async function latestAcceptedLb(person: PersonLabel, beforeDate: string): Promise<number | null> {
+  try {
+    const recent = await recentAcceptedWeights(person, beforeDate, RECENT_WEIGHT_DAYS);
+    return recent.find((e) => e.valueLb !== null)?.valueLb ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Merges readings into the days' official entries under the weight lock. `changed` = entries
+ * (re)written for review; `kept` = accepted days that only gained an extra candidate.
+ */
+async function saveWeightReadings(
+  settings: AppSettings,
+  person: PersonLabel,
+  candidates: WeightCandidate[],
+): Promise<{ changed: WeightEntry[]; kept: WeightEntry[] }> {
+  return withWeightLock(async () => {
+    const dates = candidates.map((c) => toLocalDate(c.takenAt)).sort();
+    const from = dates[0];
+    const to = dates[dates.length - 1];
+    const existing = await listWeightEntries({ person, from, to });
+    const recent = await recentAcceptedWeights(person, from, RECENT_WEIGHT_DAYS);
+    const entries = buildWeightEntries(person, candidates, existing, {
+      morningCutoffHour: settings.morningCutoffHour,
+      recent: recent.flatMap((e) => (e.valueLb === null ? [] : [{ localDate: e.localDate, valueLb: e.valueLb }])),
+      now: Date.now(),
+      expectedUnit: settings.scaleUnit,
+    });
+    const before = new Map(existing.map((e) => [e.id, e]));
+    const changed: WeightEntry[] = [];
+    const kept: WeightEntry[] = [];
+    for (const entry of entries) {
+      if (before.get(entry.id) === entry) {
+        const withExtra = attachCandidates(entry, candidates);
+        if (withExtra !== entry) await upsertWeightEntry(withExtra);
+        kept.push(withExtra);
+        continue;
+      }
+      await upsertWeightEntry(entry);
+      changed.push(entry);
+    }
+    return { changed, kept };
+  });
+}
+
+async function scaleStage(ctx: RunContext, records: PhotoRecord[]): Promise<void> {
+  if (records.length === 0) return;
+  ctx.result.scalePhotos += records.length;
+  const earliest = records.map((r) => toLocalDate(r.creationTime)).sort()[0];
+  const recentLb = await latestAcceptedLb(ctx.person, earliest);
+  const candidates: WeightCandidate[] = [];
+  const unreadable: PhotoRecord[] = [];
+  const gone: string[] = [];
+  let done = 0;
+  ctx.progress('reading_scale', 0, records.length, `Reading ${records.length} scale photos…`);
+  const started = await mapLimit(
+    records,
+    AI_CONCURRENCY,
+    async (record) => {
+      try {
+        const outcome = await readScalePhoto(ctx.settings, record, recentLb, ctx.signal);
+        if (outcome.kind === 'reading') candidates.push(outcome.candidate);
+        else if (outcome.kind === 'gone') gone.push(record.assetId);
+        else unreadable.push(record);
+      } catch (e) {
+        await photoFailed(ctx, record, e);
+      }
+      done++;
+      ctx.progress('reading_scale', done, records.length, `Read ${done} of ${records.length} scale photos`);
+    },
+    () => ctx.shouldStop(),
+  );
+  if (started < records.length) ctx.result.partial = true;
+
+  if (candidates.length > 0) {
+    const { changed } = await saveWeightReadings(ctx.settings, ctx.person, candidates);
+    ctx.result.weightEntriesCreated += changed.filter((e) => e.status === 'needs_review').length;
+  }
+  // Only after the entries are saved, so a crash in between re-reads the photos next time.
+  await markProcessed([...candidates.map((c) => c.assetId), ...unreadable.map((r) => r.assetId), ...gone]);
+  for (const id of gone) await setPhotoErrorQuietly(id, PHOTO_GONE);
+  for (const record of unreadable) {
+    // A photo the classifier guessed wrong is fine to drop silently; one the user picked is not.
+    if (hasPresetCategory(record)) await setPhotoErrorQuietly(record.assetId, 'No readable scale display');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4: food photos → meals
+// ---------------------------------------------------------------------------
+
+async function loadLibrary(): Promise<LibraryItem[]> {
+  try {
+    return await listLibrary();
+  } catch (e) {
+    log.warn(`could not load the food library: ${errorMessage(e)}`);
+    return [];
+  }
+}
+
+async function estimateGroup(ctx: RunContext, group: PhotoRecord[], library: LibraryItem[]): Promise<void> {
+  const ids = group.map((p) => p.assetId);
+  try {
+    const { images, missing } = await loadMealImages(group);
+    if (images.length === 0) {
+      await markProcessed(ids);
+      for (const id of ids) await setPhotoErrorQuietly(id, PHOTO_GONE);
+      return;
+    }
+    const estimate = await estimateAndReconcile({
+      images,
+      slot: guessMealSlot(group[0].creationTime),
+      notes: '',
+      answers: [],
+      library,
+      hint: '',
+      settings: ctx.settings,
+      signal: ctx.signal,
+    });
+    if (!isEmptyEstimate(estimate)) {
+      const present = group.filter((p) => !missing.includes(p.assetId));
+      await upsertMeal(newMealEntry(ctx.person, present, estimate, Date.now()));
+      ctx.result.mealsCreated++;
+    }
+    await markProcessed(ids);
+  } catch (e) {
+    if (isCancelled(e)) return ctx.aiFailed(e);
+    const message = errorMessage(e);
+    for (const id of ids) await setPhotoErrorQuietly(id, message);
+    ctx.addError(`Meal (${describePhoto(group[0])}): ${message}`);
+    ctx.aiFailed(e);
+  }
+}
+
+async function foodStage(ctx: RunContext, records: PhotoRecord[]): Promise<void> {
+  if (records.length === 0) return;
+  ctx.result.foodPhotos += records.length;
+  const groups = groupMealPhotos(records, ctx.settings.mealGroupingMinutes);
+  const library = await loadLibrary();
+  let done = 0;
+  ctx.progress('estimating_meals', 0, groups.length, `Estimating ${groups.length} meals…`);
+  const started = await mapLimit(
+    groups,
+    AI_CONCURRENCY,
+    async (group) => {
+      await estimateGroup(ctx, group, library);
+      done++;
+      ctx.progress('estimating_meals', done, groups.length, `Estimated ${done} of ${groups.length} meals`);
+    },
+    () => ctx.shouldStop(),
+  );
+  if (started < groups.length) ctx.result.partial = true;
+}
+
+// ---------------------------------------------------------------------------
+// Finish
+// ---------------------------------------------------------------------------
+
+function summary(result: ProcessResult): string {
+  const parts = [
+    `${result.weightEntriesCreated} weigh-in${result.weightEntriesCreated === 1 ? '' : 's'}`,
+    `${result.mealsCreated} meal${result.mealsCreated === 1 ? '' : 's'}`,
+  ];
+  return `${parts.join(' and ')} ready to review${result.partial ? ' (more next run)' : ''}`;
+}
+
+async function finishRun(
+  ctx: RunContext,
+  startedAt: number,
+  window: { startMs: number; endMs: number },
+  explicitWindow: boolean,
+): Promise<void> {
+  const { result } = ctx;
+  ctx.progress('saving', 0, 1, 'Saving…');
+  if (!result.partial) {
+    const next = nextLastScanEnd(ctx.settings.lastScanEnd, window, explicitWindow);
+    if (next !== null) {
+      try {
+        await updateSettings({ lastScanEnd: next });
+      } catch (e) {
+        ctx.addError(`Couldn't save scan progress: ${errorMessage(e)}`);
+      }
+    }
+  }
+  try {
+    await recordRun(startedAt, result);
+  } catch (e) {
+    log.warn(`could not record the run: ${errorMessage(e)}`);
+  }
+  const created = result.weightEntriesCreated + result.mealsCreated;
+  if (created > 0 && AUTOMATIC_REASONS.includes(result.reason)) {
+    try {
+      await notifyReviewReady(result.weightEntriesCreated, result.mealsCreated);
+    } catch (e) {
+      log.warn(`could not post review notification: ${errorMessage(e)}`);
+    }
+  }
+  ctx.progress('done', 1, 1, summary(result));
+}
+
+async function runPipeline(opts: ProcessOptions): Promise<ProcessResult> {
+  const startedAt = Date.now();
+  const settings = await getSettings();
+  const person = requirePerson(settings);
+  const window = opts.window ?? nextScanWindow(settings, startedAt);
+  const deadline = opts.timeBudgetMs !== undefined ? startedAt + Math.max(0, opts.timeBudgetMs) : Number.POSITIVE_INFINITY;
+  const ctx = new RunContext(settings, person, opts.reason, window, deadline, opts.signal, opts.onProgress);
+  const cloud = settings.classificationMode === 'cloud_thumbnails';
+  const range = retryRange(window);
+
+  try {
+    let classificationComplete = true;
+    if (cloud && !ctx.stopHere()) {
+      await scanStage(ctx, window);
+      classificationComplete = !ctx.stopHere() && (await classifyStage(ctx, range));
+    }
+    if (!ctx.stopHere()) {
+      const scale = await pendingPhotos(range, ['scale'], cloud);
+      try {
+        await scaleStage(ctx, scale);
+      } finally {
+        release(scale);
+      }
+    }
+    // Meals wait for classification to finish: a meal's later photos may still be unsorted,
+    // and estimating now would split one meal into two.
+    if (classificationComplete && !ctx.stopHere()) {
+      const food = await pendingPhotos(range, ['food', 'nutrition_label'], cloud);
+      try {
+        await foodStage(ctx, food);
+      } finally {
+        release(food);
+      }
+    }
+  } catch (e) {
+    ctx.addError(errorMessage(e));
+    ctx.result.partial = true;
+  }
+  await finishRun(ctx, startedAt, window, opts.window !== undefined);
+  return ctx.result;
+}
+
+/** Single-flight: a second call while running returns the in-progress promise. */
+export async function processPhotos(opts: ProcessOptions): Promise<ProcessResult> {
+  if (!inFlight) {
+    inFlight = runPipeline(opts).finally(() => {
+      inFlight = null;
+    });
+  }
+  return inFlight;
+}
+
+/** True while a run is in progress (including quick-log / picked-photo processing). */
 export function isProcessing(): boolean {
-  throw new Error('not implemented');
+  return inFlight !== null || sideJobs > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Quick log and hand-picked photos
+// ---------------------------------------------------------------------------
+
+/** Copies the camera file (in the cache, which the OS may purge) into the app's documents. */
+async function storeCapture(uri: string, id: string): Promise<string> {
+  try {
+    const dir = new Directory(Paths.document, CAPTURE_DIR);
+    dir.create({ intermediates: true, idempotent: true });
+    const source = new File(uri);
+    const dest = new File(dir, `${id}${source.extension || '.jpg'}`);
+    await source.copy(dest);
+    return dest.uri;
+  } catch (e) {
+    // Still process it now; only keeping the image for later review is at risk.
+    log.warn(`could not keep captured photo: ${errorMessage(e)}`);
+    return uri;
+  }
+}
+
+async function captureScale(settings: AppSettings, person: PersonLabel, record: PhotoRecord): Promise<string> {
+  const recentLb = await latestAcceptedLb(person, record.localDate);
+  const outcome = await readScalePhoto(settings, record, recentLb);
+  if (outcome.kind !== 'reading') {
+    await markProcessed([record.assetId]);
+    const message =
+      outcome.kind === 'gone' ? PHOTO_GONE : "Couldn't read a weight from that photo — retake it or type the number in.";
+    await setPhotoErrorQuietly(record.assetId, message);
+    throw new Error(message);
+  }
+  await saveWeightReadings(settings, person, [outcome.candidate]);
+  await markProcessed([record.assetId]);
+  return weightEntryId(person, toLocalDate(outcome.candidate.takenAt));
+}
+
+async function captureMeal(settings: AppSettings, person: PersonLabel, record: PhotoRecord): Promise<string> {
+  const { images } = await loadMealImages([record]);
+  if (images.length === 0) throw new Error(PHOTO_GONE);
+  const estimate = await estimateAndReconcile({
+    images,
+    slot: guessMealSlot(record.creationTime),
+    notes: '',
+    answers: [],
+    library: await loadLibrary(),
+    hint: '',
+    settings,
+  });
+  if (isEmptyEstimate(estimate)) {
+    await markProcessed([record.assetId]);
+    const message = "Couldn't find any food in that photo — retake it or type the meal in.";
+    await setPhotoErrorQuietly(record.assetId, message);
+    throw new Error(message);
+  }
+  const meal = newMealEntry(person, [record], estimate, Date.now());
+  await upsertMeal(meal);
+  await markProcessed([record.assetId]);
+  return meal.id;
 }
 
 /**
@@ -36,7 +695,60 @@ export async function processCapturedPhoto(
   category: 'scale' | 'food',
   takenAt: number,
 ): Promise<{ kind: 'weight' | 'meal'; id: string }> {
-  throw new Error('not implemented');
+  return sideJob(async () => {
+    const settings = await getSettings();
+    const person = requirePerson(settings);
+    const id = newId();
+    const storedUri = await storeCapture(uri, id);
+    const record = presetPhotoRecord(
+      { assetId: `${CAPTURE_ASSET_PREFIX}${id}`, uri: storedUri, creationTime: takenAt, origin: 'capture' },
+      category,
+      Date.now(),
+    );
+    // Recorded first, so a failure (or the app being killed) leaves it for the next run to retry.
+    await insertNewPhotos([record]);
+    claim([record]);
+    try {
+      if (category === 'scale') return { kind: 'weight' as const, id: await captureScale(settings, person, record) };
+      return { kind: 'meal' as const, id: await captureMeal(settings, person, record) };
+    } catch (e) {
+      await setPhotoErrorQuietly(record.assetId, errorMessage(e));
+      throw e;
+    } finally {
+      release([record]);
+    }
+  });
+}
+
+/** Photos the user picked, as records with their chosen category (existing rows are re-labelled). */
+async function registerPickedPhotos(
+  assets: { assetId: string; uri: string; creationTime: number }[],
+  category: 'scale' | 'food',
+): Promise<PhotoRecord[]> {
+  const now = Date.now();
+  const known = new Map((await getPhotos(assets.map((a) => a.assetId))).map((p) => [p.assetId, p]));
+  const fresh = assets.filter((a) => !known.has(a.assetId));
+  await insertNewPhotos(fresh.map((a) => presetPhotoRecord({ ...a, origin: 'library' }, category, now)));
+  const records: PhotoRecord[] = [];
+  for (const asset of assets) {
+    const existing = known.get(asset.assetId);
+    if (existing) await setClassification(asset.assetId, category, PRESET_CATEGORY_CONFIDENCE);
+    records.push(
+      existing
+        ? { ...existing, uri: asset.uri || existing.uri, category, categoryConfidence: PRESET_CATEGORY_CONFIDENCE }
+        : presetPhotoRecord({ ...asset, origin: 'library' }, category, now),
+    );
+  }
+  return records;
+}
+
+/** Food photos that already belong to a meal in the queue or the sheet (picking them again would double count). */
+async function withoutLoggedMealPhotos(person: PersonLabel, records: PhotoRecord[]): Promise<PhotoRecord[]> {
+  if (records.length === 0) return records;
+  const dates = records.map((r) => toLocalDate(r.creationTime)).sort();
+  const meals = await listMeals({ person, statuses: LIVE_MEAL_STATUSES, from: dates[0], to: dates[dates.length - 1] });
+  const used = new Set(meals.flatMap((m) => m.assetIds));
+  return records.filter((r) => !used.has(r.assetId));
 }
 
 /**
@@ -47,5 +759,50 @@ export async function processPickedPhotos(
   assets: { assetId: string; uri: string; creationTime: number }[],
   category: 'scale' | 'food',
 ): Promise<ProcessResult> {
-  throw new Error('not implemented');
+  return sideJob(async () => {
+    const startedAt = Date.now();
+    const settings = await getSettings();
+    const person = requirePerson(settings);
+    const unique = [...new Map(assets.map((a) => [a.assetId, a])).values()];
+    const times = unique.map((a) => a.creationTime);
+    const window = unique.length
+      ? { startMs: Math.min(...times), endMs: Math.max(...times) + 1 }
+      : { startMs: startedAt, endMs: startedAt };
+    const ctx = new RunContext(settings, person, 'manual', window, Number.POSITIVE_INFINITY);
+    ctx.result.photosScanned = unique.length;
+
+    const mine = claim(unique);
+    if (mine.length < unique.length) {
+      ctx.addError(`${unique.length - mine.length} photo(s) are already being processed.`);
+    }
+    try {
+      const records = await registerPickedPhotos(mine, category);
+      if (category === 'scale') {
+        await scaleStage(ctx, records);
+      } else {
+        const fresh = await withoutLoggedMealPhotos(person, records);
+        if (fresh.length < records.length) {
+          ctx.addError(`${records.length - fresh.length} photo(s) are already part of a logged meal.`);
+        }
+        await foodStage(ctx, fresh);
+      }
+    } catch (e) {
+      ctx.addError(errorMessage(e));
+    } finally {
+      release(mine);
+    }
+    try {
+      await recordRun(startedAt, ctx.result);
+    } catch (e) {
+      log.warn(`could not record the run: ${errorMessage(e)}`);
+    }
+    return ctx.result;
+  });
+}
+
+/** Test-only: forget in-flight state. */
+export function __resetProcessForTests(): void {
+  inFlight = null;
+  sideJobs = 0;
+  claimed.clear();
 }

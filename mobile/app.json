@@ -1,22 +1,31 @@
 {
   "expo": {
-    "name": "mobile",
-    "slug": "mobile",
+    "name": "Diced",
+    "slug": "diced",
     "version": "1.0.0",
+    "scheme": "diced",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.example.diced"
     },
     "android": {
+      "package": "com.example.diced",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "blockedPermissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_AUDIO",
+        "android.permission.ACCESS_MEDIA_LOCATION"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
@@ -24,8 +33,33 @@
     "plugins": [
       "expo-router",
       "expo-sqlite",
-      "expo-secure-store",
+      [
+        "expo-secure-store",
+        {
+          "faceIDPermission": false
+        }
+      ],
       "expo-background-task",
+      "expo-notifications",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Diced looks through the photos you take each week to find pictures of your bathroom scale and your meals, so it can log your weight and calories. Choose Full Access so new photos are found.",
+          "savePhotosPermission": false,
+          "isAccessMediaLocationEnabled": false,
+          "granularPermissions": [
+            "photo"
+          ]
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Diced looks through the photos you take each week to find pictures of your bathroom scale and your meals, so it can log your weight and calories. Choose Full Access so new photos are found.",
+          "cameraPermission": "Diced uses the camera when you photograph your scale or a meal in Quick log.",
+          "microphonePermission": false
+        }
+      ],
       "expo-image"
     ]
   }
