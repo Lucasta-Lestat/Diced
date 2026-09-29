@@ -30,14 +30,17 @@ import type {
   PhotoAsset,
   PhotoRecord,
   ProcessProgress,
+  ProcessResult,
   WeightEntry,
 } from '../../types';
 import {
   __resetProcessForTests,
+  cancelProcessing,
   isProcessing,
   processCapturedPhoto,
   processPhotos,
   processPickedPhotos,
+  subscribeProcessProgress,
 } from '../process';
 
 jest.mock('expo-crypto', () => ({ randomUUID: () => `uuid-${++mockUuid}` }));
@@ -400,7 +403,7 @@ describe('processPhotos (cloud mode)', () => {
       useUsda: true,
       webLookupForRestaurants: true,
       userContext: false,
-      signal: undefined,
+      signal: expect.any(AbortSignal),
     });
 
     expect([...photos.values()].filter((p) => p.processedAt !== null).map((p) => p.assetId).sort()).toEqual([
@@ -563,6 +566,38 @@ describe('processPhotos (cloud mode)', () => {
     expect(a.reason).toBe('manual');
     expect(listPhotosInRange).toHaveBeenCalledTimes(1);
     expect(isProcessing()).toBe(false);
+  });
+
+  it('lets a caller that joined a running run follow its progress and stop it', async () => {
+    const joinerProgress: ProcessProgress[] = [];
+    const joiner = new AbortController();
+    let second: Promise<ProcessResult> | null = null;
+    jest.mocked(classifyBatch).mockImplementationOnce(async (inputs) => {
+      // The background task started the run; the process-week screen joins it, then cancels.
+      second = processPhotos({ reason: 'deeplink', signal: joiner.signal, onProgress: (p) => joinerProgress.push(p) });
+      joiner.abort();
+      return Object.fromEntries(inputs.map((i) => [i.assetId, { category: 'food' as const, confidence: 0.9 }]));
+    });
+    const first = processPhotos({ reason: 'background', window: WINDOW });
+    const result = await first;
+    expect(await second).toBe(result);
+    expect(result.partial).toBe(true);
+    expect(estimateMeal).not.toHaveBeenCalled();
+    expect(joinerProgress.length).toBeGreaterThan(0);
+  });
+
+  it('cancelProcessing stops the in-flight run and reports progress to subscribers', async () => {
+    const seen: ProcessProgress[] = [];
+    const unsubscribe = subscribeProcessProgress((p) => seen.push(p));
+    jest.mocked(classifyBatch).mockImplementationOnce(async (inputs) => {
+      expect(cancelProcessing()).toBe(true);
+      return Object.fromEntries(inputs.map((i) => [i.assetId, { category: 'food' as const, confidence: 0.9 }]));
+    });
+    const result = await processPhotos({ reason: 'manual', window: WINDOW });
+    unsubscribe();
+    expect(result.partial).toBe(true);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(cancelProcessing()).toBe(false);
   });
 
   it('requires a person', async () => {
@@ -915,6 +950,10 @@ describe('meals spread over runs', () => {
     library = [asset('food-1', at(27, 12, 30))];
     const controller = new AbortController();
     await processPhotos({ reason: 'manual', window: WINDOW, signal: controller.signal });
-    expect(jest.mocked(reconcileEstimate).mock.calls[0][1]).toMatchObject({ signal: controller.signal });
+    // The run links the caller's signal to its own controller, so aborting the caller reaches it.
+    const passed = jest.mocked(reconcileEstimate).mock.calls[0][1].signal!;
+    expect(passed.aborted).toBe(false);
+    controller.abort();
+    expect(passed.aborted).toBe(true);
   });
 });

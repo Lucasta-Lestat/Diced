@@ -100,6 +100,11 @@ const log = logger('pipeline');
 // ---------------------------------------------------------------------------
 
 let inFlight: Promise<ProcessResult> | null = null;
+/** Stops the in-flight run, whoever started it (UI, deep link, background task). */
+let runController: AbortController | null = null;
+/** Callers that joined the in-flight run, plus subscribeProcessProgress listeners. */
+const progressListeners = new Set<(p: ProcessProgress) => void>();
+let lastProgress: ProcessProgress | null = null;
 let sideJobs = 0;
 /**
  * Quick-log captures and hand-picked photos run alongside a scheduled run; claiming makes sure
@@ -797,14 +802,75 @@ async function runPipeline(opts: ProcessOptions): Promise<ProcessResult> {
   return ctx.result;
 }
 
-/** Single-flight: a second call while running returns the in-progress promise. */
+function broadcastProgress(p: ProcessProgress): void {
+  lastProgress = p;
+  for (const listener of [...progressListeners]) {
+    try {
+      listener(p);
+    } catch (e) {
+      log.warn(`progress listener threw: ${errorMessage(e)}`);
+    }
+  }
+}
+
+/** Aborting `signal` stops the run's own controller (and so every request it has in flight). */
+function forwardAbort(signal: AbortSignal | undefined, controller: AbortController): void {
+  if (!signal) return;
+  if (signal.aborted) controller.abort();
+  else signal.addEventListener('abort', () => controller.abort(), { once: true });
+}
+
+/**
+ * Single-flight: a second call while running returns the in-progress promise. A joining caller
+ * still gets progress (its onProgress) and can stop the run (its signal) — e.g. the process-week
+ * screen joining a run the background task started.
+ */
 export async function processPhotos(opts: ProcessOptions): Promise<ProcessResult> {
   if (!inFlight) {
-    inFlight = runPipeline(opts).finally(() => {
-      inFlight = null;
+    const controller = new AbortController();
+    forwardAbort(opts.signal, controller);
+    runController = controller;
+    lastProgress = null;
+    const own = opts.onProgress;
+    const run = runPipeline({
+      ...opts,
+      signal: controller.signal,
+      onProgress: (p) => {
+        own?.(p);
+        broadcastProgress(p);
+      },
     });
+    inFlight = run.finally(() => {
+      inFlight = null;
+      runController = null;
+      lastProgress = null;
+    });
+    return inFlight;
+  }
+  if (runController) forwardAbort(opts.signal, runController);
+  const joined = opts.onProgress;
+  if (joined) {
+    if (lastProgress) joined(lastProgress);
+    progressListeners.add(joined);
+    inFlight.finally(() => progressListeners.delete(joined)).catch(() => undefined);
   }
   return inFlight;
+}
+
+/** Stops the in-flight run after the current step; false when nothing is running. */
+export function cancelProcessing(): boolean {
+  if (!runController) return false;
+  runController.abort();
+  return true;
+}
+
+/** Progress of whichever run is in flight (the latest update is delivered right away). */
+export function subscribeProcessProgress(listener: (p: ProcessProgress) => void): () => void {
+  progressListeners.add(listener);
+  if (inFlight && lastProgress) listener(lastProgress);
+  return () => {
+    progressListeners.delete(listener);
+  };
 }
 
 /** True while a run is in progress (including quick-log / picked-photo processing). */
@@ -1038,6 +1104,9 @@ export async function processPickedPhotos(
 /** Test-only: forget in-flight state. */
 export function __resetProcessForTests(): void {
   inFlight = null;
+  runController = null;
+  lastProgress = null;
+  progressListeners.clear();
   sideJobs = 0;
   claimed.clear();
 }
