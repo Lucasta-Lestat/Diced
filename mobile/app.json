@@ -27,7 +27,8 @@
         "android.permission.ACCESS_MEDIA_LOCATION",
         "android.permission.WRITE_EXTERNAL_STORAGE",
         "android.permission.USE_BIOMETRIC",
-        "android.permission.USE_FINGERPRINT"
+        "android.permission.USE_FINGERPRINT",
+        "android.permission.SYSTEM_ALERT_WINDOW"
       ]
     },
     "web": {
