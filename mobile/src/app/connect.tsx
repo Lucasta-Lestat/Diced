@@ -1,7 +1,8 @@
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useState } from 'react';
 import { getSettings } from '../config/settings';
-import { Card, HomeFallbackHeader, Muted, Notice, Screen, SheetConnectForm } from '../ui/components';
-import { firstParam } from '../ui/forms';
+import { Button, Card, HomeFallbackHeader, Muted, Notice, Row, Screen, SheetConnectForm } from '../ui/components';
+import { describeSheetUrl, firstParam, isAppsScriptUrl } from '../ui/forms';
 import { useSettings } from '../ui/hooks';
 
 /** Target of `diced://connect?url=…&token=…` (and Settings → Change sheet). */
@@ -12,6 +13,13 @@ export default function Connect() {
   const token = firstParam(params.token).trim();
   const settings = useSettings();
   const fromLink = Boolean(url && token);
+  const current = settings?.sheetWebAppUrl?.trim() || null;
+  // A link that would repoint this phone's entries elsewhere needs an explicit, informed yes first:
+  // nothing is contacted until then.
+  const replacing = fromLink && current !== null && current !== url;
+  // Keyed by the link's URL: a second link opened onto this same screen asks again.
+  const [confirmedUrl, setConfirmedUrl] = useState<string | null>(null);
+  const needsConfirm = replacing && confirmedUrl !== url;
 
   const done = async () => {
     const onboarded = (await getSettings()).onboardingComplete;
@@ -33,16 +41,34 @@ export default function Connect() {
           or copy the URL and token here.
         </Muted>
       )}
-      {settings?.sheetWebAppUrl && fromLink && settings.sheetWebAppUrl.trim() !== url ? (
-        <Notice tone="warning" message="This phone is already connected to a different sheet URL. Saving replaces it." />
-      ) : null}
-      {settings ? (
+      {needsConfirm && current ? (
+        <Card title="Replace the sheet connection?">
+          <Row label="Now sending to" detail={describeSheetUrl(current)} />
+          <Row label="This link sends to" detail={describeSheetUrl(url)} />
+          {!isAppsScriptUrl(url) ? (
+            <Notice
+              tone="danger"
+              title="Not a Google Apps Script address"
+              message="Links from your own sheet always point to script.google.com. Diced won’t send your token, weigh-ins or meals to this address — keep the current sheet."
+            />
+          ) : null}
+          <Muted>
+            After saving, approved weigh-ins and meals from this phone go to the new address. Only continue if you created this
+            link from your own sheet (e.g. after a new deployment of the Diced script, which changes its URL).
+          </Muted>
+          <Button label="Use this new sheet" variant="secondary" onPress={() => setConfirmedUrl(url)} />
+          <Button label="Keep the current sheet" onPress={finish} />
+        </Card>
+      ) : settings ? (
         <Card>
           <SheetConnectForm
+            // A new link opened onto this screen starts a fresh form with its values.
+            key={`${url}\n${token}`}
             initialUrl={url || settings.sheetWebAppUrl || ''}
             initialToken={token}
             choosePerson
             autoTest={fromLink}
+            preselectPerson={!replacing}
             onSaved={finish}
           />
         </Card>

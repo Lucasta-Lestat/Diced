@@ -9,6 +9,7 @@ import {
   formatMacros,
   formatWeight,
   formatWeightDelta,
+  joinList,
   kcalPlusMinus,
   kgToLb,
   plural,
@@ -121,5 +122,14 @@ describe('summaries', () => {
     expect(syncSummary({ weightsSynced: 2, mealsSynced: 5, deletesSynced: 0, errors: [] })).toBe('Synced 2 weigh-ins, 5 meals');
     expect(syncSummary({ weightsSynced: 0, mealsSynced: 0, deletesSynced: 0, errors: [] })).toBe('Everything is already in the sheet');
     expect(syncSummary({ weightsSynced: 0, mealsSynced: 1, deletesSynced: 1, errors: ['a', 'b'] })).toBe('Synced 1 meal, 1 removal · 2 errors');
+  });
+});
+
+describe('joinList', () => {
+  it('joins names for a sentence', () => {
+    expect(joinList([])).toBe('');
+    expect(joinList(['rice'])).toBe('rice');
+    expect(joinList(['rice', 'chicken'])).toBe('rice and chicken');
+    expect(joinList(['rice', 'chicken', 'beans'])).toBe('rice, chicken and beans');
   });
 });

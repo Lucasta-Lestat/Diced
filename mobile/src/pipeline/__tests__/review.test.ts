@@ -23,7 +23,9 @@ import {
   approveMeal,
   approveWeight,
   chooseWeightCandidate,
+  combineMeals,
   editMeal,
+  MealChangedError,
   mergeMeals,
   reestimateMeal,
   rejectMeal,
@@ -245,6 +247,22 @@ describe('weigh-in review', () => {
     await expect(chooseWeightCandidate('w:Her:2026-09-28', 'zzz')).rejects.toThrow(/readings/);
   });
 
+  it('remembers a hand-picked reading', async () => {
+    weights.set('w:Her:2026-09-28', weight());
+    expect(await chooseWeightCandidate('w:Her:2026-09-28', 'b')).toMatchObject({ chosenAssetId: 'b', chosenByUser: true, status: 'needs_review' });
+  });
+
+  it("won't put an implausible reading on an accepted day (the sheet would reject its whole batch)", async () => {
+    const misread = cand('c', at(28, 7, 5), 18.5);
+    weights.set('w:Her:2026-09-28', weight({ status: 'synced', candidates: [...weight().candidates, misread] }));
+    await expect(chooseWeightCandidate('w:Her:2026-09-28', 'c')).rejects.toThrow(/18\.5 lb\) is outside 50–700 lb/);
+    expect(weights.get('w:Her:2026-09-28')).toMatchObject({ status: 'synced', valueLb: 185 });
+    // Still in review: allowed, and approving it is refused later.
+    weights.set('w:Her:2026-09-28', weight({ candidates: [...weight().candidates, misread] }));
+    expect(await chooseWeightCandidate('w:Her:2026-09-28', 'c')).toMatchObject({ valueLb: 18.5, flags: expect.arrayContaining(['implausible_value']) });
+    await expect(approveWeight('w:Her:2026-09-28')).rejects.toThrow(/between 50 and 700/);
+  });
+
   it('queues a sheet delete only for a rejected entry that reached the sheet', async () => {
     weights.set('w:Her:2026-09-28', weight({ status: 'synced' }));
     await rejectWeight('w:Her:2026-09-28');
@@ -322,6 +340,13 @@ describe('meal review', () => {
     await expect(editMeal('m1', { time: '25:00' })).rejects.toThrow(/13:45/);
   });
 
+  it('refuses grams that would push a synced meal past the sheet limits', async () => {
+    meals.set('m1', meal({ status: 'synced' }));
+    // rice: 200 g = 260 kcal; a typo of 20000 g → 26,000 kcal.
+    await expect(editMeal('m1', { itemGrams: { 1: 20_000 } })).rejects.toThrow(/10,000 kcal/);
+    expect(meals.get('m1')).toMatchObject({ status: 'synced', final: { kcal: 510 } });
+  });
+
   it('records grams for items without known grams without inventing macros', async () => {
     meals.set('m1', meal({ estimate: estimate({ items: [foodItem('sauce', null, 90)] }) }));
     const m = await editMeal('m1', { itemGrams: { 0: 40 } });
@@ -346,6 +371,51 @@ describe('meal review', () => {
     );
     expect(m).toMatchObject({ title: 'My lunch', final: { kcal: 620 }, status: 'needs_review', error: null, updatedAt: NOW });
     expect(m.estimate?.questions.map((x) => x.id)).toEqual(['q1']);
+  });
+
+  it("keeps a new question the model numbers like an answered one (every estimate starts at q1)", async () => {
+    const oil = { id: 'q1', question: 'How much oil was the chicken cooked in?', options: ['None', '1 tbsp'], affects: ['chicken'] };
+    const dressing = { id: 'q2', question: 'Regular or light dressing?', options: ['Regular', 'Light'], affects: [] };
+    photos.set('p1', photo('p1', at(28, 12, 30)));
+    meals.set('m1', meal({ estimate: estimate({ questions: [oil, dressing] }), answers: { q1: '1 tbsp', q7: 'stale answer' } }));
+    // The model doesn't repeat the answered question; its open one comes back as q1.
+    jest.mocked(estimateAndReconcile).mockResolvedValue(
+      estimate({ questions: [{ ...dressing, id: 'q1' }, { ...oil, id: 'q2', question: 'how much oil was the chicken cooked in' }] }),
+    );
+
+    const m = await reestimateMeal('m1');
+
+    expect(m.estimate?.questions.map((q) => [q.id, q.question])).toEqual([
+      ['q1', 'How much oil was the chicken cooked in?'],
+      ['q2', 'Regular or light dressing?'],
+    ]);
+    // The dressing question is open, and answers of questions no longer listed are dropped.
+    expect(m.answers).toEqual({ q1: '1 tbsp' });
+  });
+
+  it('puts a synced meal back in review after a re-estimate, and rejecting it still deletes its row', async () => {
+    photos.set('p1', photo('p1', at(28, 12, 30)));
+    meals.set('m1', meal({ status: 'synced' }));
+    const m = await reestimateMeal('m1');
+    expect(m).toMatchObject({ status: 'needs_review', inSheet: true });
+
+    await rejectMeal('m1');
+    expect(addPendingSheetDelete).toHaveBeenCalledWith('m1', 'meal');
+    expect(meals.get('m1')?.status).toBe('rejected');
+  });
+
+  it("doesn't overwrite a meal approved while it was being re-estimated", async () => {
+    photos.set('p1', photo('p1', at(28, 12, 30)));
+    meals.set('m1', meal());
+    jest.mocked(estimateAndReconcile).mockImplementation(async () => {
+      // Approved from the list card while Claude was working.
+      meals.set('m1', { ...meals.get('m1')!, status: 'approved', updatedAt: 99 });
+      return estimate({ totals: { kcal: 900, proteinG: 1, carbsG: 1, fatG: 1 } });
+    });
+    const err = await reestimateMeal('m1').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MealChangedError); // the screen reloads the meal on this error
+    expect((err as Error).message).toMatch(/changed while it was being re-estimated/);
+    expect(meals.get('m1')).toMatchObject({ status: 'approved', final: { kcal: 510 } });
   });
 
   it("takes the model's new title when the user didn't change it", async () => {
@@ -390,6 +460,71 @@ describe('meal review', () => {
     expect(m).toMatchObject({ id: 'm1', assetIds: ['p2', 'p1'], time: '12:05', notes: 'main\ndrink', status: 'needs_review', final: { kcal: 620 } });
     expect(meals.has('m2')).toBe(false);
     expect(addPendingSheetDelete).toHaveBeenCalledWith('m2', 'meal');
+  });
+
+  it("doesn't pair one meal's answer with the other meal's question when merging", async () => {
+    const oil = { id: 'q1', question: 'How much oil?', options: ['None', '1 tbsp'], affects: [] };
+    const soda = { id: 'q1', question: 'Regular or diet soda?', options: ['Regular', 'Diet'], affects: [] };
+    const size = { id: 'q2', question: 'Drink size?', options: ['Small', 'Large'], affects: [] };
+    photos.set('p1', photo('p1', at(28, 12, 30)));
+    photos.set('p2', photo('p2', at(28, 12, 55)));
+    meals.set('m1', meal({ estimate: estimate({ questions: [oil] }), answers: { q1: '1 tbsp' } }));
+    meals.set('m2', meal({ id: 'm2', assetIds: ['p2'], time: '12:55', estimate: estimate({ title: 'Soda', questions: [soda, size] }), answers: { q2: 'Large' } }));
+
+    // Re-estimation fails, so the combined questions are what the user sees.
+    jest.mocked(estimateAndReconcile).mockRejectedValueOnce(new Error('offline'));
+    const merged = await mergeMeals('m1', 'm2');
+    expect(merged.estimate?.questions.map((q) => [q.id, q.question])).toEqual([
+      ['q1', 'How much oil?'],
+      ['q2', 'Regular or diet soda?'],
+      ['q3', 'Drink size?'],
+    ]);
+    expect(merged.answers).toEqual({ q1: '1 tbsp', q3: 'Large' });
+
+    // Retrying sends each answer with its own question only.
+    await reestimateMeal('m1');
+    expect(jest.mocked(estimateAndReconcile).mock.calls.at(-1)?.[0].answers).toEqual([
+      { question: 'How much oil?', answer: '1 tbsp' },
+      { question: 'Drink size?', answer: 'Large' },
+    ]);
+  });
+
+  it('lists a question both meals ask once, keeping whichever answer exists', () => {
+    const oil = { id: 'q1', question: 'How much oil?', options: ['None', '1 tbsp'], affects: [] };
+    const a = meal({ estimate: estimate({ questions: [oil] }) });
+    const b = meal({ id: 'm2', estimate: estimate({ questions: [{ ...oil, question: 'how much oil' }] }), answers: { q1: 'None' } });
+    expect(combineMeals(a, b, 'Lunch', NOW).questions).toEqual([oil]);
+  });
+
+  it('merging into a synced meal keeps its row tracked, so a later reject deletes it', async () => {
+    photos.set('p1', photo('p1', at(28, 12, 30)));
+    photos.set('p2', photo('p2', at(28, 12, 50)));
+    meals.set('m1', meal({ status: 'synced' }));
+    // b was synced once, then re-estimated back into review.
+    meals.set('m2', meal({ id: 'm2', assetIds: ['p2'], time: '12:50', inSheet: true }));
+
+    const merged = await mergeMeals('m1', 'm2');
+    expect(merged).toMatchObject({ id: 'm1', status: 'needs_review', inSheet: true });
+    expect(addPendingSheetDelete).toHaveBeenCalledWith('m2', 'meal');
+
+    await rejectMeal('m1');
+    expect(addPendingSheetDelete).toHaveBeenCalledWith('m1', 'meal');
+  });
+
+  it('saves nothing when a meal changed while the merge was re-estimating', async () => {
+    photos.set('p1', photo('p1', at(28, 12, 30)));
+    meals.set('m1', meal());
+    meals.set('m2', meal({ id: 'm2', assetIds: [], estimate: null, title: 'Soda' }));
+    jest.mocked(estimateAndReconcile).mockImplementation(async () => {
+      meals.set('m2', { ...meals.get('m2')!, status: 'approved', updatedAt: 99 });
+      return estimate();
+    });
+    const err = await mergeMeals('m1', 'm2').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(MealChangedError);
+    expect((err as Error).message).toMatch(/changed while they were being merged/);
+    expect(meals.get('m2')?.status).toBe('approved');
+    expect(meals.get('m1')?.assetIds).toEqual(['p1']);
+    expect(deleteMeal).not.toHaveBeenCalled();
   });
 
   it('keeps the merge with summed numbers when re-estimation fails', async () => {
@@ -438,6 +573,15 @@ describe('meal review', () => {
     expect(libraryItems[0]).toMatchObject({ id: 'lib-1', name: 'Chicken & Rice', serving: 'plate', uses: 4, synced: false, aliases: ['usual', 'Chicken and rice'] });
     expect(meals.get('m1')?.estimate?.libraryItemId).toBe('lib-1');
     await expect(saveMealToLibrary('m1', '  ', '')).rejects.toThrow(/name/);
+  });
+
+  it("adds an approved meal's use to an existing usual meal as pending (not over the sheet's count)", async () => {
+    libraryItems = [
+      { id: 'lib-1', name: 'Oats', serving: 'jar', macros: { kcal: 1, proteinG: 1, carbsG: 1, fatG: 1 }, aliases: [], addedBy: 'Him', uses: 4, updatedAt: 1, synced: true },
+    ];
+    meals.set('m1', meal({ status: 'approved' }));
+    await saveMealToLibrary('m1', 'oats', '');
+    expect(libraryItems[0]).toMatchObject({ id: 'lib-1', uses: 4, pendingUses: 1, synced: false });
   });
 
   it('approves only confident entries', async () => {

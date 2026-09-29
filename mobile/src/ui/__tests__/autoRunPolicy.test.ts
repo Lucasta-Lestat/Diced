@@ -1,5 +1,13 @@
 /// <reference types="jest" />
-import { FOREGROUND_SYNC_MIN_GAP_MS, progressLine, screenRunsPipeline, shouldForegroundSync } from '../autoRunPolicy';
+import {
+  autoRunBannerShown,
+  FOREGROUND_SYNC_MIN_GAP_MS,
+  isProcessWeekLink,
+  progressLine,
+  screenRunsPipeline,
+  shouldForegroundSync,
+  wantsWeeklyReminder,
+} from '../autoRunPolicy';
 
 describe('shouldForegroundSync', () => {
   const now = 1_000_000_000;
@@ -31,5 +39,37 @@ describe('screenRunsPipeline', () => {
   it('recognises the process-week screen', () => {
     expect(screenRunsPipeline('/process-week')).toBe(true);
     expect(screenRunsPipeline('/review')).toBe(false);
+  });
+});
+
+describe('autoRunBannerShown', () => {
+  it('shows the banner only when there is something to say, off the process-week screen', () => {
+    expect(autoRunBannerShown({ phase: 'idle' }, '/')).toBe(false);
+    expect(autoRunBannerShown({ phase: 'processing', progress: null, hidden: false }, '/review/meal/1')).toBe(true);
+    expect(autoRunBannerShown({ phase: 'processing', progress: null, hidden: false }, '/process-week')).toBe(false);
+    expect(autoRunBannerShown({ phase: 'done', message: 'x', hasNew: true }, '/')).toBe(true);
+    expect(autoRunBannerShown({ phase: 'error', message: 'x' }, '/settings')).toBe(true);
+  });
+
+  it('hides a processing banner the user dismissed', () => {
+    expect(autoRunBannerShown({ phase: 'processing', progress: null, hidden: true }, '/review/meal/1')).toBe(false);
+  });
+});
+
+describe('isProcessWeekLink', () => {
+  it('recognises the Shortcuts / reminder link in its variants', () => {
+    expect(isProcessWeekLink('diced://process-week')).toBe(true);
+    expect(isProcessWeekLink('diced:///process-week/')).toBe(true);
+    expect(isProcessWeekLink('diced://process-week?reason=manual')).toBe(true);
+    expect(isProcessWeekLink('diced://review')).toBe(false);
+    expect(isProcessWeekLink('diced://process-weekly')).toBe(false);
+    expect(isProcessWeekLink('https://example.com/process-week')).toBe(false);
+  });
+});
+
+describe('wantsWeeklyReminder', () => {
+  it('only reminds when photos are read automatically', () => {
+    expect(wantsWeeklyReminder({ classificationMode: 'cloud_thumbnails' })).toBe(true);
+    expect(wantsWeeklyReminder({ classificationMode: 'manual' })).toBe(false);
   });
 });

@@ -197,6 +197,16 @@ class FakeRange {
     return (c && c.dv) || null;
   }
 
+  setNote(note) {
+    this.eachCell((r, c) => { this.sheet.cell(r, c).note = note === null ? '' : String(note); });
+    return this;
+  }
+
+  getNote() {
+    const c = this.sheet.peek(this.row, this.col);
+    return (c && c.note) || '';
+  }
+
   bounds() {
     return { r1: this.row, c1: this.col, r2: this.getLastRow(), c2: this.getLastColumn() };
   }
@@ -264,7 +274,7 @@ class FakeSheet {
   peek(r, c) { return this.cells.get(this.key(r, c)); }
   cell(r, c) {
     const k = this.key(r, c);
-    if (!this.cells.has(k)) this.cells.set(k, { v: '', f: '', fmt: {}, dv: null });
+    if (!this.cells.has(k)) this.cells.set(k, { v: '', f: '', fmt: {}, dv: null, note: '' });
     return this.cells.get(k);
   }
 
@@ -645,7 +655,7 @@ function snapshot(ss) {
         const [br, bc] = b.split(':').map(Number);
         return ar - br || ac - bc;
       })
-      .map(([k, c]) => [k, serializeValue(c.v), c.f, JSON.stringify(c.fmt), c.dv ? JSON.stringify(c.dv) : '']),
+      .map(([k, c]) => [k, serializeValue(c.v), c.f, JSON.stringify(c.fmt), c.dv ? JSON.stringify(c.dv) : '', c.note]),
   }));
 }
 

@@ -1,4 +1,5 @@
 /** Pure mapping between app entries and sheet rows. OWNER: data-layer builder. */
+import { CHECK_PORTION_PREFIX } from '../pipeline/confidence';
 import type { FoodItem, LibraryItem, MealEntry, MealSlot, WeightEntry } from '../types';
 import type { SheetConfidence, SheetLibraryItem, SheetMealRow, SheetWeightRow } from './contract';
 
@@ -70,11 +71,19 @@ function answeredQuestions(meal: MealEntry): string[] {
   });
 }
 
+/** An assumption as a person reads it: the internal `check_portion:<item>` flag becomes `check portion of <item>`. */
+function readableAssumption(assumption: string): string {
+  const a = assumption.trim();
+  if (!a.startsWith(CHECK_PORTION_PREFIX)) return a;
+  const item = a.slice(CHECK_PORTION_PREFIX.length).trim();
+  return item ? `check portion of ${item}` : '';
+}
+
 function mealNotes(meal: MealEntry): string {
-  const assumptions = (meal.estimate?.assumptions ?? [])
-    .map((a) => a.trim())
-    .filter(Boolean)
-    .slice(0, MAX_ASSUMPTIONS);
+  const assumptions = [...new Set((meal.estimate?.assumptions ?? []).map(readableAssumption).filter(Boolean))].slice(
+    0,
+    MAX_ASSUMPTIONS,
+  );
   const parts = [
     meal.notes.trim(),
     ...answeredQuestions(meal),

@@ -79,6 +79,13 @@ describe('mergeSamples', () => {
     expect(merged.assumptions).toContain('1 of 2 independent estimates found no food in these photos.');
   });
 
+  it('keeps the leftovers-only flag when any sample saw only leftovers', () => {
+    expect(mergeSamples([estimate({ kcal: 500 }), estimate({ kcal: 520, leftoversOnly: true })]).leftoversOnly).toBe(true);
+    expect(mergeSamples([estimate({ kcal: 500 }), estimate({ kcal: 520 })])).not.toHaveProperty('leftoversOnly');
+    const empty = estimate({ kcal: 0, items: [], kcalLow: 0, kcalHigh: 0 });
+    expect(mergeSamples([empty, { ...empty, leftoversOnly: true }]).leftoversOnly).toBe(true);
+  });
+
   it('takes brand / barcode from whichever sample found them', () => {
     const merged = mergeSamples([
       estimate({ kcal: 500, confidence: 'high', brand: null }),

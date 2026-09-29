@@ -149,7 +149,7 @@ test('duplicate Entry IDs in one batch end up as one row with the last values', 
   assert.equal(sheet('Weight Log').getRange('C6').getValue(), 183.8);
 });
 
-test('rows are appended after the last row with a date, growing the sheet if needed', () => {
+test('rows are appended after the last used row, growing the sheet if needed', () => {
   const { api, sheet } = connected();
   const log = sheet('Weight Log');
   log.getRange('A6:C6').setValues([[wb.planDate(2), 'Him', 176]]); // typed by hand, no Entry ID
@@ -158,10 +158,33 @@ test('rows are appended after the last row with a date, growing the sheet if nee
   const entries = [1, 2, 3, 4].map((d) => weight({ entryId: `w:Her:d${d}`, date: `2026-10-0${d}` }));
   assert.deepEqual(api('upsertWeights', { entries }).data, { inserted: 4, updated: 0 });
   assert.equal(log.getRange('A6:C6').getValues()[0][2], 176, 'hand-typed row untouched');
-  assert.deepEqual(log.getRange('H7:H10').getValues().map((r) => r[0]), ['w:Her:d1', 'w:Her:d2', 'w:Her:d3', 'w:Her:d4']);
-  assert.equal(log.getMaxRows(), 10);
-  assert.equal(log.peek(10, 1).fmt.numberFormat, 'ddd, mmm d', 'new rows inherit the formats');
-  assert.equal(log.getRange('G9').getValue(), '', 'row 9 was reused (no date in column A)');
+  assert.equal(log.getRange('G9').getValue(), 'stray note without a date', 'a note below the data survives');
+  assert.deepEqual(log.getRange('H7:H9').getValues().map((r) => r[0]), ['', '', ''], 'blank rows above it are not reused');
+  assert.deepEqual(log.getRange('H10:H13').getValues().map((r) => r[0]), ['w:Her:d1', 'w:Her:d2', 'w:Her:d3', 'w:Her:d4']);
+  assert.equal(log.getMaxRows(), 13);
+  assert.equal(log.peek(13, 1).fmt.numberFormat, 'ddd, mmm d', 'new rows inherit the formats');
+});
+
+test('appends never overwrite a hand-typed row that has no Date or Entry ID yet', () => {
+  const { api, sheet } = connected();
+  const food = sheet('Food Log');
+  // A meal being typed by hand (Date not filled in yet), and a note in the row below it.
+  food.getRange('B5:F5').setValues([['19:00', 'Her', 'Dinner', 'Homemade lasagna (grandma recipe)', 780]]);
+  food.getRange('M6').setValue('remember to weigh the leftovers');
+  assert.deepEqual(api('upsertMeals', { entries: [meal(), meal({ entryId: 'm-2', description: 'Salad' })] }).data,
+    { inserted: 2, updated: 0 });
+  assert.deepEqual(food.getRange('A5:F5').getValues()[0],
+    ['', '19:00', 'Her', 'Dinner', 'Homemade lasagna (grandma recipe)', 780]);
+  assert.equal(food.getRange('M6').getValue(), 'remember to weigh the leftovers');
+  assert.deepEqual(food.getRange('N5:N8').getValues().map((r) => r[0]), ['', '', 'm-1', 'm-2']);
+  assert.deepEqual(food.getRange('E7:E8').getValues().map((r) => r[0]), ['Chicken burrito bowl', 'Salad']);
+
+  // Food Library's column A is Name: a row typed without a Name yet is kept too.
+  const lib = sheet('Food Library');
+  lib.getRange('B5:C5').setValues([['1 bowl', 350]]);
+  assert.deepEqual(api('upsertLibrary', { items: [libraryItem()] }).data, { inserted: 1, updated: 0 });
+  assert.deepEqual(lib.getRange('A5:C5').getValues()[0], ['', '1 bowl', 350]);
+  assert.deepEqual(lib.getRange('A6:C6').getValues()[0], ['Overnight oats', '1 jar', 420]);
 });
 
 test('a row that lost its date but kept its Entry ID is updated, never overwritten by appends', () => {

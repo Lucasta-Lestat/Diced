@@ -41,7 +41,10 @@ function isTooSmall(asset: PhotoAsset): boolean {
 /**
  * Reason to skip a photo without classifying it, or null to keep it:
  * `screenshot` (iOS mediaSubtypes / Android filename), `too_small` (< 400 px short edge),
- * `messaging_app` (filenames typical of WhatsApp/Telegram/Signal downloads), `screen_recording`.
+ * `messaging_app` (filenames typical of WhatsApp/Telegram/Signal/Messenger downloads, or a
+ * messaging app's album — see scanner.MESSAGING_ALBUMS), `screen_recording`.
+ * Messaging-app detection is best-effort: an image saved from iMessage (or a chat app that saves
+ * into no album of its own) has an ordinary camera-style name on iPhone and can't be told apart.
  * Photos taken in the app or picked by hand are always kept: the user chose them.
  */
 export function exclusionReason(asset: PhotoAsset): ExclusionReason | null {
@@ -50,7 +53,7 @@ export function exclusionReason(asset: PhotoAsset): ExclusionReason | null {
 
   if (hasSubtype(asset, 'screenshot') || SCREENSHOT_NAME.test(name)) return 'screenshot';
   if (SCREEN_RECORDING_NAME.test(name)) return 'screen_recording';
-  if (MESSAGING_NAMES.some((re) => re.test(name))) return 'messaging_app';
+  if (asset.fromMessagingAlbum || MESSAGING_NAMES.some((re) => re.test(name))) return 'messaging_app';
   if (isTooSmall(asset)) return 'too_small';
   return null;
 }

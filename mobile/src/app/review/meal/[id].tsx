@@ -3,7 +3,16 @@ import { useState } from 'react';
 import { Alert, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { getSettings } from '../../../config/settings';
 import { getMeal, listMeals } from '../../../db/meals';
-import { approveMeal, editMeal, mergeMeals, reestimateMeal, rejectMeal, saveMealToLibrary, type MealEdit } from '../../../pipeline/review';
+import {
+  approveMeal,
+  editMeal,
+  MealChangedError,
+  mergeMeals,
+  reestimateMeal,
+  rejectMeal,
+  saveMealToLibrary,
+  type MealEdit,
+} from '../../../pipeline/review';
 import type { AppSettings, MealEntry } from '../../../types';
 import {
   Badge,
@@ -32,14 +41,15 @@ import {
   formatKcalWithRange,
   formatMacros,
   itemSourceText,
+  joinList,
   MEAL_SLOTS,
   methodText,
   slotText,
 } from '../../../ui/format';
 import { requestSync } from '../../../ui/autoRun';
 import { firstParam, macrosToInputs, parseMacroInputs, parseTimeInput, type MacroInputs } from '../../../ui/forms';
-import { loadPhotoUris, useAction, useAsync, useDraft } from '../../../ui/hooks';
-import { mergeCandidates, unansweredQuestions } from '../../../ui/reviewModel';
+import { loadPhotoUris, useAction, useAsync, useDraft, useStillHere } from '../../../ui/hooks';
+import { mergeCandidates, splitAssumptions, unansweredQuestions } from '../../../ui/reviewModel';
 import { colors, spacing, type } from '../../../ui/theme';
 
 interface MealData {
@@ -70,7 +80,11 @@ export default function MealDetail() {
     <>
       <Stack.Screen options={{ title: current ? slotText(current.meal.slot) : 'Meal' }} />
       {current ? (
-        <MealEditor data={current} onMeal={(meal) => detail.setData((prev) => ({ ...(prev ?? current), meal }))} />
+        <MealEditor
+          data={current}
+          onMeal={(meal) => detail.setData((prev) => ({ ...(prev ?? current), meal }))}
+          onReload={() => void detail.reload()}
+        />
       ) : (
         <Screen>
           <ErrorBanner message={detail.error} onRetry={() => void detail.reload()} />
@@ -84,9 +98,17 @@ export default function MealDetail() {
 interface EditorProps {
   data: MealData;
   onMeal: (meal: MealEntry) => void;
+  /** Load the meal (and the day's meals) again, e.g. after a re-estimate was refused because it changed. */
+  onReload: () => void;
 }
 
-function MealEditor({ data, onMeal }: EditorProps) {
+/** A re-estimate / merge was refused because the meal changed meanwhile: show what is stored now. */
+function reloadIfChanged(e: unknown, reload: () => void): never {
+  if (e instanceof MealChangedError) reload();
+  throw e;
+}
+
+function MealEditor({ data, onMeal, onReload }: EditorProps) {
   const router = useRouter();
   const { meal, uris } = data;
   // A re-estimate or merge can replace these fields; the drafts follow the stored values.
@@ -117,7 +139,7 @@ function MealEditor({ data, onMeal }: EditorProps) {
 
   const reestimate = useAction(async () => {
     await flushText();
-    onMeal(await reestimateMeal(meal.id));
+    onMeal(await reestimateMeal(meal.id).catch((e: unknown) => reloadIfChanged(e, onReload)));
   });
   const approve = useAction(async () => {
     await flushText();
@@ -150,6 +172,7 @@ function MealEditor({ data, onMeal }: EditorProps) {
 
   const busy = edit.pending || reestimate.pending || approve.pending || reject.pending;
   const est = meal.estimate;
+  const assumptions = splitAssumptions(est?.assumptions ?? []);
   const canApprove = meal.status === 'needs_review' || meal.status === 'rejected' || meal.status === 'sync_error';
   const actionError = approve.error ?? reject.error ?? reestimate.error ?? edit.error;
 
@@ -184,6 +207,13 @@ function MealEditor({ data, onMeal }: EditorProps) {
         {est && est.samples > 1 ? <Badge label={`${est.samples} estimates averaged`} /> : null}
       </View>
       {meal.error ? <ErrorBanner title={meal.status === 'sync_error' ? 'Sync failed' : 'Estimate problem'} message={meal.error} /> : null}
+      {assumptions.checkPortions.length ? (
+        <Notice
+          tone="warning"
+          title={`Check the portion of ${joinList(assumptions.checkPortions)}`}
+          message="The nutrition database and Claude disagree a lot here, so this meal isn't approved automatically. Fix the grams below if needed, then approve."
+        />
+      ) : null}
 
       <TextField
         label="Description"
@@ -217,7 +247,7 @@ function MealEditor({ data, onMeal }: EditorProps) {
       </View>
 
       <TotalsCard meal={meal} busy={busy} onSave={(final) => edit.run({ final })} />
-      <ItemsCard meal={meal} busy={busy} onGrams={(index, grams) => edit.run({ itemGrams: { [index]: grams } })} />
+      <ItemsCard meal={meal} busy={busy} checkPortions={assumptions.checkPortions} onGrams={(index, grams) => edit.run({ itemGrams: { [index]: grams } })} />
       <QuestionsCard meal={meal} busy={busy} onAnswer={(answers) => edit.run({ answers })} />
 
       <Card title="Notes" subtitle="Anything the photo can't show — cooking oil, dressing, how much you ate. Used when you re-estimate.">
@@ -239,17 +269,17 @@ function MealEditor({ data, onMeal }: EditorProps) {
           disabled={busy && !reestimate.pending}
           accessibilityHint="Asks Claude again using your notes and answers"
         />
-        {reestimate.pending ? <Muted>Re-estimating with your notes and answers — this can take up to a minute.</Muted> : null}
+        {reestimate.pending ? <Muted>Re-estimating with your notes and answers — this usually takes under a minute, sometimes a few.</Muted> : null}
       </Card>
 
-      {est?.assumptions.length ? (
+      {assumptions.notes.length ? (
         <Card title="Assumptions">
-          <Bullets items={est.assumptions} />
+          <Bullets items={assumptions.notes} />
         </Card>
       ) : null}
 
       <LibraryCard meal={meal} flush={flushText} />
-      <MergeCard meal={meal} sameDay={data.sameDay} flush={flushText} />
+      <MergeCard meal={meal} sameDay={data.sameDay} flush={flushText} onReload={onReload} />
     </Screen>
   );
 }
@@ -321,7 +351,17 @@ function TotalsCard({ meal, busy, onSave }: { meal: MealEntry; busy: boolean; on
   );
 }
 
-function ItemsCard({ meal, busy, onGrams }: { meal: MealEntry; busy: boolean; onGrams: (index: number, grams: number) => Promise<unknown> }) {
+function ItemsCard({
+  meal,
+  busy,
+  checkPortions,
+  onGrams,
+}: {
+  meal: MealEntry;
+  busy: boolean;
+  checkPortions: string[];
+  onGrams: (index: number, grams: number) => Promise<unknown>;
+}) {
   const items = meal.estimate?.items ?? [];
   if (items.length === 0) return null;
   return (
@@ -342,6 +382,7 @@ function ItemsCard({ meal, busy, onGrams }: { meal: MealEntry; busy: boolean; on
                 {differs ? <Muted>Claude’s own estimate was {formatKcal(modelKcal)}; the {itemSourceText(item.source)} value is used.</Muted> : null}
               </View>
               <View style={styles.itemBadges}>
+                {checkPortions.includes(item.name) ? <Badge label="Check portion" tone="warning" /> : null}
                 <Badge label={itemSourceText(item.source)} tone={item.source === 'model' ? 'neutral' : 'info'} />
                 <ConfidenceBadge confidence={item.confidence} short />
               </View>
@@ -425,16 +466,40 @@ function LibraryCard({ meal, flush }: { meal: MealEntry; flush: () => Promise<vo
   );
 }
 
-function MergeCard({ meal, sameDay, flush }: { meal: MealEntry; sameDay: MealEntry[]; flush: () => Promise<void> }) {
+function MergeCard({
+  meal,
+  sameDay,
+  flush,
+  onReload,
+}: {
+  meal: MealEntry;
+  sameDay: MealEntry[];
+  flush: () => Promise<void>;
+  onReload: () => void;
+}) {
   const router = useRouter();
+  const stillHere = useStillHere();
   const [open, setOpen] = useState(false);
+  const [mergedId, setMergedId] = useState<string | null>(null);
   const candidates = mergeCandidates(meal, sameDay);
   const merge = useAction(async (target: MealEntry) => {
     await flush();
-    const merged = await mergeMeals(target.id, meal.id);
-    router.replace({ pathname: '/review/meal/[id]', params: { id: merged.id } });
+    const merged = await mergeMeals(target.id, meal.id).catch((e: unknown) => reloadIfChanged(e, onReload));
+    // Re-estimating takes a while; if the user went elsewhere meanwhile, don't replace that screen.
+    if (stillHere()) router.replace({ pathname: '/review/meal/[id]', params: { id: merged.id } });
+    else setMergedId(merged.id);
   });
 
+  if (mergedId) {
+    return (
+      <Notice
+        tone="success"
+        message="Merged. This meal’s photos are now part of the other meal."
+        actionLabel="Open"
+        onAction={() => router.replace({ pathname: '/review/meal/[id]', params: { id: mergedId } })}
+      />
+    );
+  }
   if (candidates.length === 0) return null;
   const confirm = (target: MealEntry) =>
     Alert.alert(

@@ -11,8 +11,11 @@ phone into rows in your training-plan Google Sheet:
   USDA / Open Food Facts data, and you review them before they're written to the
   Food Log.
 
-It runs weekly on its own. On Android it uses a background job. On iPhone a Shortcuts
-automation opens the app (iOS doesn't allow fixed-time background jobs).
+In the default automatic mode it runs weekly on its own. On Android it uses a
+background job (roughly every 12 hours, so the weekly run can come some hours after
+the chosen time). On iPhone a Shortcuts automation opens the app (iOS doesn't allow
+fixed-time background jobs). In manual mode nothing is scanned; you add photos or type
+entries in Quick log.
 
 | Where | What |
 |---|---|
@@ -24,12 +27,15 @@ automation opens the app (iOS doesn't allow fixed-time background jobs).
 
 ## Development
 
+Node 22 LTS (or 20.19.4+, as React Native 0.86 / Metro require).
+
 ```sh
 cd mobile
 npm install
 npx tsc --noEmit        # typecheck
 npx jest                # unit tests
 npx expo lint           # lint
+npx expo-doctor         # dependency / config checks
 npx expo run:android    # or run:ios — needs a development build (not Expo Go)
 
 node --test ../apps-script/test   # Apps Script tests (no dependencies)

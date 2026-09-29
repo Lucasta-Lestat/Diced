@@ -64,7 +64,8 @@ export async function setMealStatus(id: string, status: EntryStatus, error?: str
 
 /**
  * Marks meals synced only if they were not edited since they were read for the sync
- * (same updatedAt), so an edit made mid-sync is pushed next time. Returns # marked.
+ * (same updatedAt), so an edit made mid-sync is pushed next time. Also records that the row is
+ * in the sheet (`inSheet`), which outlives a later re-estimate / merge. Returns # marked.
  */
 export async function markMealsSynced(meals: { id: string; updatedAt: number }[]): Promise<number> {
   if (meals.length === 0) return 0;
@@ -73,8 +74,35 @@ export async function markMealsSynced(meals: { id: string; updatedAt: number }[]
     for (const m of meals) {
       const r = await db.runAsync(
         `UPDATE meals SET status = 'synced',
-           data = json_set(data, '$.status', 'synced', '$.error', NULL)
+           data = json_set(data, '$.status', 'synced', '$.error', NULL, '$.inSheet', json('true'))
          WHERE id = ? AND updated_at = ?`,
+        m.id,
+        m.updatedAt,
+      );
+      marked += r.changes;
+    }
+    return marked;
+  });
+}
+
+/**
+ * Marks meals sync_error with `message`, but only those not changed since they were read for the
+ * sync (same updatedAt): a meal rejected or re-estimated while the request was in flight must keep
+ * its new status, or the next sync would push it. Returns # marked.
+ */
+export async function markMealsSyncError(meals: { id: string; updatedAt: number }[], message: string): Promise<number> {
+  if (meals.length === 0) return 0;
+  return withTransaction(async (db) => {
+    const now = Date.now();
+    let marked = 0;
+    for (const m of meals) {
+      const r = await db.runAsync(
+        `UPDATE meals SET status = 'sync_error', updated_at = ?,
+           data = json_set(data, '$.status', 'sync_error', '$.updatedAt', ?, '$.error', ?)
+         WHERE id = ? AND updated_at = ?`,
+        now,
+        now,
+        message,
         m.id,
         m.updatedAt,
       );

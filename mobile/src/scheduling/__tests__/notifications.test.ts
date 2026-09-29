@@ -115,6 +115,13 @@ describe('scheduleWeeklyReminder', () => {
       N.scheduleNotificationAsync.mock.invocationCallOrder[0],
     );
   });
+
+  it('only removes the reminder in manual mode (a run there reads no photos)', async () => {
+    const { scheduleWeeklyReminder, WEEKLY_REMINDER_ID } = notifications;
+    await scheduleWeeklyReminder({ scheduleWeekday: 1, scheduleHour: 9, scheduleMinute: 5, classificationMode: 'manual' } as AppSettings);
+    expect(N.cancelScheduledNotificationAsync).toHaveBeenCalledWith(WEEKLY_REMINDER_ID);
+    expect(N.scheduleNotificationAsync).not.toHaveBeenCalled();
+  });
 });
 
 describe('configureNotifications', () => {

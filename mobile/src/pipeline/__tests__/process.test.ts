@@ -5,10 +5,11 @@ import { estimateMeal } from '../../ai/food';
 import { readScale, toPounds, type ScaleReading } from '../../ai/scale';
 import { getSettings, updateSettings } from '../../config/settings';
 import { listLibrary } from '../../db/library';
-import { listMeals, upsertMeal } from '../../db/meals';
+import { getMeal, listMeals, upsertMeal } from '../../db/meals';
 import {
   getPhotos,
   insertNewPhotos,
+  listPickedPhotos,
   listUnclassified,
   listUnprocessed,
   markProcessed,
@@ -19,7 +20,7 @@ import { recordRun } from '../../db/runs';
 import { listWeightEntries, recentAcceptedWeights, upsertWeightEntry } from '../../db/weights';
 import { toLocalDate } from '../../lib/dates';
 import { reconcileEstimate } from '../../nutrition/reconcile';
-import { makeThumbnail, prepareForModel, type PreparedImage } from '../../photos/images';
+import { makeThumbnail, prepareForModel, prepareScaleImage, type PreparedImage } from '../../photos/images';
 import { listPhotosInRange, resolveReadableUri } from '../../photos/scanner';
 import { notifyReviewReady } from '../../scheduling/notifications';
 import type {
@@ -71,6 +72,7 @@ jest.mock('../../db/database', () => ({
 jest.mock('../../db/photos', () => ({
   getPhotos: jest.fn(),
   insertNewPhotos: jest.fn(),
+  listPickedPhotos: jest.fn(),
   listUnclassified: jest.fn(),
   listUnprocessed: jest.fn(),
   markProcessed: jest.fn(),
@@ -82,11 +84,11 @@ jest.mock('../../db/weights', () => ({
   recentAcceptedWeights: jest.fn(),
   upsertWeightEntry: jest.fn(),
 }));
-jest.mock('../../db/meals', () => ({ listMeals: jest.fn(), upsertMeal: jest.fn() }));
+jest.mock('../../db/meals', () => ({ getMeal: jest.fn(), listMeals: jest.fn(), upsertMeal: jest.fn() }));
 jest.mock('../../db/library', () => ({ listLibrary: jest.fn() }));
 jest.mock('../../db/runs', () => ({ recordRun: jest.fn() }));
 jest.mock('../../photos/scanner', () => ({ listPhotosInRange: jest.fn(), resolveReadableUri: jest.fn() }));
-jest.mock('../../photos/images', () => ({ makeThumbnail: jest.fn(), prepareForModel: jest.fn() }));
+jest.mock('../../photos/images', () => ({ makeThumbnail: jest.fn(), prepareForModel: jest.fn(), prepareScaleImage: jest.fn() }));
 jest.mock('../../ai/classify', () => ({ classifyBatch: jest.fn() }));
 jest.mock('../../ai/scale', () => ({ readScale: jest.fn(), toPounds: jest.fn() }));
 jest.mock('../../ai/food', () => ({ estimateMeal: jest.fn() }));
@@ -230,6 +232,12 @@ function installFakes(): void {
     width: 1176,
     height: 1568,
   }));
+  jest.mocked(prepareScaleImage).mockImplementation(async (uri) => ({
+    base64: `full:${uri.replace('ph://', '').replace(/^file:\/\/\/docs\/captures\/(.*)\.jpg$/, 'capture:$1')}`,
+    mediaType: 'image/jpeg',
+    width: 1677,
+    height: 2236,
+  }));
 
   jest.mocked(insertNewPhotos).mockImplementation(async (records) => {
     let n = 0;
@@ -241,6 +249,9 @@ function installFakes(): void {
     return n;
   });
   jest.mocked(getPhotos).mockImplementation(async (ids) => ids.flatMap((id) => (photos.has(id) ? [{ ...photos.get(id)! }] : [])));
+  jest.mocked(listPickedPhotos).mockImplementation(async (start, end) =>
+    [...photos.values()].filter((p) => p.assetId.startsWith('picked:') && p.creationTime >= start && p.creationTime <= end).sort(byTime),
+  );
   jest.mocked(listUnclassified).mockImplementation(async (start, end) =>
     [...photos.values()].filter((p) => inRange(p, start, end) && p.category === null).sort(byTime),
   );
@@ -269,7 +280,16 @@ function installFakes(): void {
   jest.mocked(recentAcceptedWeights).mockResolvedValue([]);
   jest.mocked(upsertWeightEntry).mockImplementation(async (e) => void weights.set(e.id, e));
   jest.mocked(upsertMeal).mockImplementation(async (m) => void meals.set(m.id, m));
-  jest.mocked(listMeals).mockImplementation(async () => [...meals.values()]);
+  jest.mocked(getMeal).mockImplementation(async (id) => meals.get(id) ?? null);
+  jest.mocked(listMeals).mockImplementation(async (filter) =>
+    [...meals.values()].filter(
+      (m) =>
+        (!filter?.person || m.person === filter.person) &&
+        (!filter?.statuses || filter.statuses.includes(m.status)) &&
+        (!filter?.from || m.localDate >= filter.from) &&
+        (!filter?.to || m.localDate <= filter.to),
+    ),
+  );
   jest.mocked(listLibrary).mockResolvedValue([]);
   jest.mocked(recordRun).mockResolvedValue(undefined);
   jest.mocked(notifyReviewReady).mockResolvedValue(undefined);
@@ -376,7 +396,12 @@ describe('processPhotos (cloud mode)', () => {
     // Meals are estimated concurrently; pick the lunch request by its photos.
     const input = jest.mocked(estimateMeal).mock.calls.map(([i]) => i).find((i) => i.images.length === 2);
     expect(input).toMatchObject({ slot: 'lunch', notes: '', answers: [], plateDiameterIn: 10.5, accuracyMode: 'standard' });
-    expect(jest.mocked(reconcileEstimate)).toHaveBeenCalledWith(expect.anything(), { useUsda: true, webLookupForRestaurants: true });
+    expect(jest.mocked(reconcileEstimate)).toHaveBeenCalledWith(expect.anything(), {
+      useUsda: true,
+      webLookupForRestaurants: true,
+      userContext: false,
+      signal: undefined,
+    });
 
     expect([...photos.values()].filter((p) => p.processedAt !== null).map((p) => p.assetId).sort()).toEqual([
       'food-1',
@@ -616,6 +641,49 @@ describe('processCapturedPhoto', () => {
     await expect(processCapturedPhoto('file:///cache/x.jpg', 'scale', at(28, 7))).rejects.toThrow(/temporarily/);
     expect(photos.get('capture:uuid-1')).toMatchObject({ processedAt: null, error: 'Claude is temporarily unavailable' });
   });
+
+  it("doesn't leave a failed meal photo for a later run (a retake would log the food twice)", async () => {
+    jest.mocked(estimateMeal).mockRejectedValueOnce(new Error("Couldn't reach Claude — check your internet connection."));
+    await expect(processCapturedPhoto('file:///cache/lunch.jpg', 'food', at(28, 12, 5))).rejects.toThrow(
+      /internet connection\. Nothing was logged — take the photo again or type the meal in\.$/,
+    );
+    expect(photos.get('capture:uuid-1')?.processedAt).not.toBeNull();
+    expect(photos.get('capture:uuid-1')?.error).toMatch(/Nothing was logged/);
+
+    // The retake succeeds; the next run doesn't turn the failed first shot into a second meal.
+    const retake = await processCapturedPhoto('file:///cache/lunch2.jpg', 'food', at(28, 12, 6));
+    await processPhotos({ reason: 'manual', window: WINDOW });
+    expect([...meals.keys()]).toEqual([retake.id]);
+    expect(estimateMeal).toHaveBeenCalledTimes(2);
+  });
+
+  it('adds another shot of a meal still in review to that meal and returns it', async () => {
+    const first = await processCapturedPhoto('file:///cache/lunch.jpg', 'food', at(28, 12, 0));
+    const second = await processCapturedPhoto('file:///cache/lunch-after.jpg', 'food', at(28, 12, 15));
+    expect(second).toEqual(first);
+    expect(meals.size).toBe(1);
+    expect(meals.get(first.id)?.assetIds).toEqual(['capture:uuid-1', 'capture:uuid-3']);
+    expect(photos.get('capture:uuid-3')?.processedAt).not.toBeNull();
+  });
+
+  it('adds a leftovers-only capture to the meal eaten up to 90 minutes earlier', async () => {
+    const dinner = await processCapturedPhoto('file:///cache/dinner.jpg', 'food', at(28, 18, 30));
+    jest.mocked(estimateMeal).mockImplementation(async (input) => {
+      const ids = input.images.map((i) => idOf(i.image));
+      return { ...mealEstimate(ids.length), ...(ids.length === 1 && ids[0] !== 'capture:uuid-1' ? { leftoversOnly: true } : {}) };
+    });
+    const after = await processCapturedPhoto('file:///cache/plate.jpg', 'food', at(28, 19, 45));
+    expect(after).toEqual(dinner);
+    expect(meals.get(dinner.id)?.assetIds).toEqual(['capture:uuid-1', 'capture:uuid-3']);
+  });
+
+  it('keeps its own guidance when no food is found', async () => {
+    jest.mocked(estimateMeal).mockResolvedValueOnce({ ...mealEstimate(1), items: [], totals: { kcal: 0, proteinG: 0, carbsG: 0, fatG: 0 } });
+    await expect(processCapturedPhoto('file:///cache/desk.jpg', 'food', at(28, 12))).rejects.toThrow(
+      /^Couldn't find any food in that photo — retake it or type the meal in\.$/,
+    );
+    expect(photos.get('capture:uuid-1')?.processedAt).not.toBeNull();
+  });
 });
 
 describe('processPickedPhotos', () => {
@@ -666,9 +734,187 @@ describe('processPickedPhotos', () => {
     expect(created?.assetIds).toEqual(['a']);
   });
 
-  it('reads picked scale photos', async () => {
-    const result = await processPickedPhotos([{ assetId: 's', uri: 'ph://s', creationTime: at(19, 6, 50) }], 'scale');
+  it('reads picked scale photos at full model resolution', async () => {
+    const result = await processPickedPhotos([{ assetId: 'ph://s', uri: 'ph://s', creationTime: at(19, 6, 50) }], 'scale');
     expect(result.weightEntriesCreated).toBe(1);
     expect(weights.get('w:Her:2026-09-19')?.valueLb).toBe(185);
+    expect(prepareScaleImage).toHaveBeenCalledWith('ph://s');
+    expect(prepareForModel).not.toHaveBeenCalled();
+  });
+
+  it("keeps its own copy of a pick without a library id (the picker's copy is in the purgeable cache)", async () => {
+    const result = await processPickedPhotos(
+      [
+        { assetId: 'picked:IMG_7.jpg', uri: 'file:///cache/ImagePicker/7.jpg', creationTime: at(20, 12, 0) },
+        { assetId: 'ph://lib-8', uri: 'file:///cache/ImagePicker/8.jpg', creationTime: at(20, 12, 5) },
+      ],
+      'food',
+    );
+    expect(result.mealsCreated).toBe(1);
+    expect(mockCopies).toEqual([{ from: 'file:///cache/ImagePicker/7.jpg', to: 'file:///docs/picked/uuid-1.jpg' }]);
+    expect(photos.get('picked:IMG_7.jpg')?.uri).toBe('file:///docs/picked/uuid-1.jpg');
+    // A library photo can be read from the library again if its cache copy disappears.
+    expect(photos.get('ph://lib-8')?.uri).toBe('file:///cache/ImagePicker/8.jpg');
+  });
+
+  it('a later scan skips the library copy of a photo picked without a library id', async () => {
+    await processPickedPhotos([{ assetId: 'picked:IMG_7.jpg', uri: 'file:///cache/ImagePicker/7.jpg', creationTime: at(27, 12, 0) }], 'food');
+    expect(meals.size).toBe(1);
+    library = [
+      asset('food-7', at(27, 12, 0) + 1000, { filename: 'img_7.JPG' }), // the same photo, found by the scan
+      asset('food-8', at(27, 19, 0), { filename: 'IMG_7.jpg' }), // same name, another time: another photo
+    ];
+    const result = await processPhotos({ reason: 'weekly', window: WINDOW });
+    expect(photos.has('food-7')).toBe(false);
+    expect(result).toMatchObject({ photosScanned: 1, mealsCreated: 1 });
+    expect([...meals.values()].map((m) => m.assetIds)).toEqual([['picked:IMG_7.jpg'], ['food-8']]);
+  });
+});
+
+describe('meals spread over runs', () => {
+  const inReview = (id: string, assetIds: string[], time: string, patch: Partial<MealEntry> = {}): MealEntry => ({
+    id,
+    person: 'Her',
+    localDate: '2026-09-27',
+    time,
+    slot: 'lunch',
+    assetIds,
+    estimate: mealEstimate(assetIds.length),
+    final: { kcal: 400, proteinG: 14, carbsG: 70, fatG: 6 },
+    title: 'Meal from 1 photo(s)',
+    answers: {},
+    notes: '',
+    status: 'needs_review',
+    error: null,
+    updatedAt: 3,
+    ...patch,
+  });
+  const processedFood = (id: string, time: number) =>
+    record(id, time, { category: 'food', categoryConfidence: 0.99, classifiedAt: 1, processedAt: 2 });
+  /** estimateMeal answers "leftovers only" when every photo sent is one of `after`. */
+  const leftoversFor = (...after: string[]) =>
+    jest.mocked(estimateMeal).mockImplementation(async (input) => {
+      const ids = input.images.map((i) => idOf(i.image));
+      const only = ids.every((id) => after.includes(id));
+      return { ...mealEstimate(ids.length), ...(only ? { leftoversOnly: true } : {}) };
+    });
+
+  it('adds a later photo of the same meal to the meal still in review instead of making a second meal', async () => {
+    photos.set('food-1', processedFood('food-1', at(27, 12, 30)));
+    meals.set('m1', inReview('m1', ['food-1'], '12:30', { notes: 'no dressing' }));
+    library = [asset('food-2', at(27, 12, 45))];
+
+    const result = await processPhotos({ reason: 'manual', window: WINDOW });
+
+    expect(result.mealsCreated).toBe(0);
+    expect([...meals.keys()]).toEqual(['m1']);
+    expect(meals.get('m1')).toMatchObject({ assetIds: ['food-1', 'food-2'], status: 'needs_review', time: '12:30', notes: 'no dressing', updatedAt: expect.any(Number) });
+    const input = jest.mocked(estimateMeal).mock.calls[0][0];
+    expect(input.images.map((i) => idOf(i.image))).toEqual(['food-1', 'food-2']);
+    expect(input.notes).toBe('no dressing');
+    expect(photos.get('food-2')?.processedAt).not.toBeNull();
+  });
+
+  it('starts a new meal when the earlier one was already approved', async () => {
+    photos.set('food-1', processedFood('food-1', at(27, 12, 30)));
+    meals.set('m1', inReview('m1', ['food-1'], '12:30', { status: 'approved' }));
+    library = [asset('food-2', at(27, 12, 45))];
+    const result = await processPhotos({ reason: 'manual', window: WINDOW });
+    expect(result.mealsCreated).toBe(1);
+    expect(meals.get('m1')?.assetIds).toEqual(['food-1']);
+  });
+
+  it('leaves a meal photographed minutes ago for the next automatic run', async () => {
+    jest.spyOn(Date, 'now').mockReturnValue(at(27, 12, 40));
+    library = [asset('food-1', at(27, 12, 30)), asset('food-old', at(27, 8, 0))];
+
+    const result = await processPhotos({ reason: 'daily', window: { startMs: at(27, 0), endMs: at(27, 12, 40) } });
+
+    expect(result.mealsCreated).toBe(1);
+    expect(result.foodPhotos).toBe(1);
+    expect(photos.get('food-1')?.processedAt).toBeNull();
+    expect(photos.get('food-old')?.processedAt).not.toBeNull();
+    // Tapping "Process new photos" doesn't wait.
+    await processPhotos({ reason: 'manual', window: { startMs: at(27, 12, 40), endMs: at(27, 12, 41) } });
+    expect(photos.get('food-1')?.processedAt).not.toBeNull();
+  });
+
+  it('holds back only the meal next to a photo that failed to sort for the first time', async () => {
+    photos.set('food-1', record('food-1', at(27, 12, 30), { category: 'food', categoryConfidence: 0.99, classifiedAt: 1 }));
+    photos.set('food-9', record('food-9', at(27, 19, 0), { category: 'food', categoryConfidence: 0.99, classifiedAt: 1 }));
+    photos.set('new-2', record('new-2', at(27, 12, 40)));
+    photos.set('old-3', record('old-3', at(27, 19, 5), { error: 'failed last run' }));
+    jest.mocked(classifyBatch).mockRejectedValue(new Error('Claude API error 500: oops'));
+
+    const result = await processPhotos({ reason: 'manual', window: WINDOW });
+
+    // Lunch waits for its unsorted neighbour; dinner's neighbour already failed in an earlier run
+    // (a photo that keeps failing must not block its meal forever), so dinner goes ahead.
+    expect(result.mealsCreated).toBe(1);
+    expect(photos.get('food-1')?.processedAt).toBeNull();
+    expect(photos.get('food-9')?.processedAt).not.toBeNull();
+    expect(result.foodPhotos).toBe(1);
+
+    // Next run the neighbour has failed once already: lunch no longer waits.
+    const next = await processPhotos({ reason: 'manual', window: WINDOW });
+    expect(next.mealsCreated).toBe(1);
+    expect(photos.get('food-1')?.processedAt).not.toBeNull();
+  });
+
+  it('adds a leftovers-only "after" photo to the earlier meal in the same run', async () => {
+    library = [asset('food-dinner', at(27, 19, 0)), asset('food-after', at(27, 19, 40))];
+    leftoversFor('food-after');
+
+    const result = await processPhotos({ reason: 'manual', window: WINDOW });
+
+    expect(result.mealsCreated).toBe(1);
+    const [meal] = [...meals.values()];
+    expect(meal.assetIds).toEqual(['food-dinner', 'food-after']);
+    expect(meal.time).toBe('19:00');
+    const sent = jest.mocked(estimateMeal).mock.calls.map(([i]) => i.images.map((x) => idOf(x.image)));
+    expect(sent).toContainEqual(['food-dinner', 'food-after']);
+    expect(photos.get('food-after')?.processedAt).not.toBeNull();
+  });
+
+  it('adds a leftovers-only photo to a meal from an earlier run up to 90 minutes before it', async () => {
+    photos.set('food-1', processedFood('food-1', at(27, 18, 0)));
+    meals.set('m1', inReview('m1', ['food-1'], '18:00', { slot: 'dinner' }));
+    library = [asset('food-after', at(27, 19, 20))];
+    leftoversFor('food-after');
+
+    const result = await processPhotos({ reason: 'manual', window: WINDOW });
+
+    expect(result.mealsCreated).toBe(0);
+    expect(meals.get('m1')?.assetIds).toEqual(['food-1', 'food-after']);
+  });
+
+  it('keeps a leftovers-only photo as its own meal when no earlier meal is in review', async () => {
+    library = [asset('food-after', at(27, 19, 20))];
+    leftoversFor('food-after');
+    const result = await processPhotos({ reason: 'manual', window: WINDOW });
+    expect(result.mealsCreated).toBe(1);
+    expect([...meals.values()][0].assetIds).toEqual(['food-after']);
+  });
+
+  it("doesn't overwrite a meal the user changed while the photos were being added", async () => {
+    photos.set('food-1', processedFood('food-1', at(27, 12, 30)));
+    meals.set('m1', inReview('m1', ['food-1'], '12:30'));
+    library = [asset('food-2', at(27, 12, 45))];
+    jest.mocked(estimateMeal).mockImplementationOnce(async (input) => {
+      meals.set('m1', { ...meals.get('m1')!, status: 'approved', updatedAt: 50 });
+      return mealEstimate(input.images.length);
+    });
+
+    const result = await processPhotos({ reason: 'manual', window: WINDOW });
+
+    expect(meals.get('m1')).toMatchObject({ status: 'approved', assetIds: ['food-1'] });
+    expect(result.mealsCreated).toBe(1);
+  });
+
+  it("passes the run's abort signal down to the database lookups", async () => {
+    library = [asset('food-1', at(27, 12, 30))];
+    const controller = new AbortController();
+    await processPhotos({ reason: 'manual', window: WINDOW, signal: controller.signal });
+    expect(jest.mocked(reconcileEstimate).mock.calls[0][1]).toMatchObject({ signal: controller.signal });
   });
 });

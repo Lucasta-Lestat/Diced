@@ -53,6 +53,7 @@ describe('readScale', () => {
     const { url, headers, body } = requests[0];
     expect(url).toMatch(/\/v1\/messages\?beta=true$/);
     expect(headers['anthropic-beta'].split(',')).toContain(FALLBACK_BETA);
+    expect(headers['x-stainless-timeout']).toBe('300');
     expect(body).toMatchObject({
       model: 'claude-opus-5-5',
       max_tokens: 16000,

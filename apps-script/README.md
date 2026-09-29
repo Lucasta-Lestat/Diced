@@ -40,11 +40,19 @@ Google Sheets phone app.
 7. **Reload the Google Sheet.** A **Diced** menu appears next to *Help*.
 8. **Connect each phone.** Choose **Diced → Show app connection info**. If the URL
    box is empty or says it's the `/dev` test URL, paste the `/exec` URL from step 6.
-   The sheet remembers it. Then, on **each phone**:
+   Only a `https://script.google.com/…/exec` address is accepted; the link and QR code
+   appear once it is there. The sheet remembers it. Then, on **each phone**:
    * scan the QR code with the camera, or open the `diced://connect?...` link on the
      phone (for example, email it to yourself). The Diced app opens, tests the
-     connection and asks whether the phone is **Her** or **Him**;
-   * or open the app's **Settings** and paste the URL and the token.
+     connection and asks whether the phone is **Her** or **Him**. If that phone is
+     already connected to a different URL, the app first asks **Replace the sheet
+     connection?** and names both addresses;
+   * or paste the URL and the token on the app's **Connect the sheet** setup step
+     (once set up: **Settings → Google Sheet → Change…**).
+
+   The QR encoder is loaded from cdnjs, pinned with Subresource Integrity. If it
+   can't load (offline, or blocked), the dialog says "QR code unavailable". Use the
+   link instead.
 
 ## What setup changes in the workbook
 
@@ -54,14 +62,16 @@ Google Sheets phone app.
 | **Food Log** (new) | One row per meal, written after you review it in the app. You can edit these rows freely. |
 | **Food Library** (new) | Your "usual meals" with confirmed calories, shared by both phones. |
 | **Daily Log** (new, right after Weekly Check-in) | Formulas only. There's one row per day of the plan with each person's weight, calories, protein, calorie target and number of meals logged. Today's row is highlighted. On the right, the weekly block shows average intake, days logged and **implied maintenance**, which is a check on whether the photo-based calorie estimates run high or low. |
-| **Weekly Check-in** | *Weight (lb)* for her (E) and him (K) becomes **that week's average of the daily weigh-ins**. Those columns are renamed *Avg weight (lb) auto* and are no longer yellow. The note at the top is updated. Any weight you had already typed there (e.g. week 1's 185) is first copied into Weight Log, dated that week's Monday, with Source = `migrated`. |
+| **Weekly Check-in** | *Weight (lb)* for her (E) and him (K) becomes **that week's average of the daily weigh-ins**. Those columns are renamed *Avg weight (lb) auto* and are no longer yellow. The note at the top is updated. Any weight you had already typed there (e.g. week 1's 185) is first copied into Weight Log, dated that week's Monday, with Source = `migrated`. Only a number from 50 to 700 lb is copied, and only if Weight Log has no different weight for that Monday yet. Any other typed value (text such as `201.4 lb`, an out-of-range number, or a second weight for a Monday that is already logged) is kept as a **note on its cell**, and setup tells you how many there were. |
 | **Dashboard** | The *NOW* formulas are wrapped in `ARRAYFORMULA`. In Google Sheets they were blank because the Excel "last value" trick doesn't work there. The *▶ His week / ▶ Her week* links are rewritten so Sheets can follow them. |
 | **Game Plan** | The *HOW TO USE* text for Weekly Check-in now describes daily weigh-ins, and a *Daily Log* row is added. |
 | Script properties | `DICED_TOKEN` (the app token) and `DICED_WEBAPP_URL` (if you pasted the URL). Document property `DICED_SCHEMA_VERSION`. |
 
 Running setup again is safe; it gives the same result as running it once. Use
 **Diced → Set up / repair Diced tabs** any time a formula gets typed over. A weight
-typed into Weekly Check-in is copied into Weight Log before its formula is restored.
+typed into Weekly Check-in is copied into Weight Log before its formula is restored,
+unless that Monday already has a Weight Log entry (the phone logs every day, Mondays
+included). A typed value that isn't copied is kept as a note on its cell.
 
 ## After changing `Code.gs`
 
@@ -87,7 +97,8 @@ immediately. The dialog then shows a new link; reconnect both phones with it.
 | `unauthorized` | The token changed or was mistyped. Reconnect using *Show app connection info*. |
 | `not_found` (a tab is missing) | Run **Diced → Set up / repair Diced tabs**. |
 | "The sheet is busy" | Both phones synced at once, or setup was running. Try again in a moment. |
-| An HTML/sign-in page instead of JSON | The deployment isn't set to *Who has access: Anyone*, or the phone has the `/dev` URL instead of the `/exec` one. |
+| An HTML/sign-in page instead of JSON | The deployment isn't set to *Who has access: Anyone*. |
+| "Diced only connects to a Google Apps Script web-app URL" or "This is the /dev test URL" | The phone has a URL that isn't the `https://script.google.com/…/exec` deployment URL. Reconnect using *Show app connection info*. |
 | Old behaviour after a code change | You saved the code but didn't publish a **new version** (see above). |
 
 ## For developers
@@ -95,8 +106,11 @@ immediately. The dialog then shows a new link; reconnect both phones with it.
 * The API and sheet layout are specified in [`docs/SHEET_SCHEMA.md`](../docs/SHEET_SCHEMA.md).
   `mobile/src/sync/contract.ts` mirrors it in TypeScript. Change all three together.
 * `DICED_CONFIG` at the top of `Code.gs` maps each person to their columns.
+* The web-app URL pattern (`DICED_EXEC_URL_RE`) is mirrored in
+  `mobile/src/sync/webAppUrl.ts`; the phone refuses any other address. Change both
+  together.
 * Tests use Node's built-in runner with an in-memory fake of the Apps Script
-  services (no npm install needed; Node 20+):
+  services (no npm install needed; Node 20+, 22 LTS recommended):
 
   ```sh
   node --test apps-script/test

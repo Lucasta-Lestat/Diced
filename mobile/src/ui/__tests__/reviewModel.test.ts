@@ -9,6 +9,8 @@ import {
   isConfidentWeight,
   mergeCandidates,
   scaledKcal,
+  splitAssumptions,
+  summaryNeedsRefresh,
   unansweredQuestions,
   weekWeighIns,
 } from '../reviewModel';
@@ -180,5 +182,37 @@ describe('scaledKcal', () => {
     expect(scaledKcal(248, 150, 200)).toBe(331);
     expect(scaledKcal(248, null, 200)).toBeNull();
     expect(scaledKcal(248, 0, 200)).toBeNull();
+  });
+});
+
+describe('splitAssumptions', () => {
+  it('turns check_portion tokens into flagged item names and keeps the rest as notes', () => {
+    expect(
+      splitAssumptions(['Cooked in 1 tbsp oil', 'check_portion:white rice', 'Portion from a 10 in plate', 'check_portion:white rice', 'check_portion: chicken ']),
+    ).toEqual({ notes: ['Cooked in 1 tbsp oil', 'Portion from a 10 in plate'], checkPortions: ['white rice', 'chicken'] });
+    expect(splitAssumptions([])).toEqual({ notes: [], checkPortions: [] });
+  });
+});
+
+describe('summaryNeedsRefresh', () => {
+  const HOUR = 60 * 60_000;
+  // Wednesday 2026-09-30 12:00 local
+  const wed = new Date(2026, 8, 30, 12, 0, 0).getTime();
+
+  it('refreshes when missing or older than the limit', () => {
+    expect(summaryNeedsRefresh(null, wed, HOUR)).toBe(true);
+    expect(summaryNeedsRefresh(wed - 2 * HOUR, wed, HOUR)).toBe(true);
+    expect(summaryNeedsRefresh(wed - 10 * 60_000, wed, HOUR)).toBe(false);
+  });
+
+  it('refreshes once a new plan week has started, however recent the copy is', () => {
+    const sundayNight = new Date(2026, 9, 4, 23, 50, 0).getTime();
+    const mondayMorning = new Date(2026, 9, 5, 0, 5, 0).getTime();
+    expect(summaryNeedsRefresh(sundayNight, mondayMorning, HOUR)).toBe(true);
+    expect(summaryNeedsRefresh(mondayMorning, mondayMorning + 10 * 60_000, HOUR)).toBe(false);
+  });
+
+  it('refreshes when the clock went backwards', () => {
+    expect(summaryNeedsRefresh(wed + HOUR, wed, HOUR)).toBe(true);
   });
 });

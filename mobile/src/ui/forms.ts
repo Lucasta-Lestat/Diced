@@ -1,5 +1,6 @@
 /** Pure input parsing/validation for forms and deep links (no native imports). */
 import { addDays, isValidLocalDate } from '../lib/dates';
+import { isAppsScriptExecUrl } from '../sync/webAppUrl';
 import type { LocalDate, LocalTime, Macros, MealSlot, WeightUnit } from '../types';
 import { formatInt, kgToLb } from './format';
 
@@ -131,12 +132,70 @@ export function recentDates(today: LocalDate, count = 7): LocalDate[] {
   return Array.from({ length: count }, (_, i) => addDays(today, -i));
 }
 
-/** Loose check before pinging: Apps Script web-app URLs end in /exec. */
+/** Hosts an Apps Script web app is served from. */
+const APPS_SCRIPT_HOSTS = ['script.google.com', 'script.googleusercontent.com'];
+
+export interface SheetUrlParts {
+  /** Lower-case host name (after any `user@` part, which can disguise the real host). */
+  host: string;
+  /** Apps Script deployment id (`/macros/s/<id>/exec`), when the URL has one. */
+  deploymentId: string | null;
+}
+
+/** Host and deployment id of an https URL; null when it isn't one. Regex-based (no URL polyfill needed). */
+export function sheetUrlParts(url: string): SheetUrlParts | null {
+  const m = /^https:\/\/(?:[^/?#@\s]*@)?([^/?#:@\s]+)(?::\d+)?([/?#][^\s]*)?$/i.exec(url.trim());
+  if (!m) return null;
+  const deploymentId = /\/s\/([^/?#\s]+)\/(?:exec|dev)\b/.exec(m[2] ?? '')?.[1] ?? null;
+  return { host: m[1].toLowerCase(), deploymentId };
+}
+
+/** True for a Google Apps Script web-app address (what `Diced → Show app connection info` gives). */
+export function isAppsScriptUrl(url: string): boolean {
+  const parts = sheetUrlParts(url);
+  return parts !== null && APPS_SCRIPT_HOSTS.includes(parts.host);
+}
+
+/** `script.google.com · deployment AKfycb…9xQw` — names where entries would be sent, for confirmations. */
+export function describeSheetUrl(url: string): string {
+  const parts = sheetUrlParts(url);
+  if (!parts) return url.trim().length > 60 ? `${url.trim().slice(0, 57)}…` : url.trim();
+  const id = parts.deploymentId;
+  if (!id) return parts.host;
+  const short = id.length > 14 ? `${id.slice(0, 6)}…${id.slice(-4)}` : id;
+  return `${parts.host} · deployment ${short}`;
+}
+
+/** Loose check before pinging: Apps Script web-app URLs live on script.google.com and end in /exec. */
 export function sheetUrlHint(url: string): string | null {
   const t = url.trim();
   if (!t) return null;
   if (!/^https:\/\//i.test(t)) return 'The URL must start with https://';
+  if (!isAppsScriptUrl(t)) {
+    const host = sheetUrlParts(t)?.host ?? 'another site';
+    return `This address is on ${host}, not Google Apps Script (script.google.com). Diced won’t connect to it — whoever runs it would receive your token, weigh-ins and meals. Use the link from your own sheet.`;
+  }
   if (/\/dev\/?$/.test(t)) return 'This is the /dev test URL — use the deployment URL ending in /exec.';
-  if (!/\/exec\/?(\?.*)?$/.test(t)) return 'Apps Script web-app URLs usually end in /exec.';
+  // Same rule the sheets client enforces before sending anything (sync/webAppUrl.ts).
+  if (!isAppsScriptExecUrl(t)) return 'Use the web-app URL exactly as the sheet shows it: https://script.google.com/…/exec';
   return null;
+}
+
+/** What a Claude key test returns (`kind` is the AiApiErrorKind when the client reports it). */
+export interface KeyTestResultLike {
+  ok: boolean;
+  message: string;
+  kind?: string | null;
+}
+
+/**
+ * Whether a key whose test failed may still be saved ("Save anyway"): only a rejected key is
+ * refused. Offline, rate-limited, overloaded, permission or model-not-found failures don't mean the
+ * key is wrong (the model id can be fixed in Settings afterwards).
+ */
+export function keyTestAllowsSave(result: KeyTestResultLike): boolean {
+  if (result.ok) return true;
+  if (typeof result.kind === 'string') return result.kind !== 'auth';
+  // Without a kind, the rejected-key message is the one failure that means the key itself is bad.
+  return !/key rejected/i.test(result.message);
 }

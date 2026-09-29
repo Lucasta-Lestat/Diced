@@ -50,6 +50,7 @@ describe('lookupPublishedNutrition', () => {
     });
     const req = fake.requests[0];
     expect(req.headers['anthropic-beta'].split(',')).toContain(FALLBACK_BETA);
+    expect(req.headers['x-stainless-timeout']).toBe('300');
     expect(req.body).toMatchObject({
       model: 'claude-opus-5-5',
       fallbacks: 'default',

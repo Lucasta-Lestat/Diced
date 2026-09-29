@@ -3,7 +3,7 @@ import { StyleSheet, Text, View } from 'react-native';
 import { getSettings, setSecret, updateSettings } from '../../config/settings';
 import type { PingData } from '../../sync/contract';
 import { pingSheet, refreshSheetInfo, saveSheetInfo } from '../../sync/sheetsClient';
-import { sheetUrlHint } from '../forms';
+import { describeSheetUrl, isAppsScriptUrl, sheetUrlHint } from '../forms';
 import { useAction } from '../hooks';
 import { colors, spacing, type } from '../theme';
 import { Button } from './Button';
@@ -19,13 +19,26 @@ export interface SheetConnectFormProps {
   initialToken?: string;
   /** Show the Her/Him picker (from the sheet's people) and save it. */
   choosePerson: boolean;
-  /** Test right away (values came from a diced://connect link). */
+  /** Test right away (values came from a diced://connect link). Never done for a non-Apps-Script host. */
   autoTest?: boolean;
+  /**
+   * Pre-select this phone's current person when the sheet lists it. Off when a link replaces an
+   * existing connection, so saving takes a deliberate choice.
+   */
+  preselectPerson?: boolean;
   saveLabel?: string;
   onSaved: (result: { ping: PingData; person: string | null }) => void;
 }
 
-export function SheetConnectForm({ initialUrl = '', initialToken = '', choosePerson, autoTest = false, saveLabel = 'Save connection', onSaved }: SheetConnectFormProps) {
+export function SheetConnectForm({
+  initialUrl = '',
+  initialToken = '',
+  choosePerson,
+  autoTest = false,
+  preselectPerson = true,
+  saveLabel = 'Save connection',
+  onSaved,
+}: SheetConnectFormProps) {
   const [url, setUrl] = useState(initialUrl);
   const [token, setToken] = useState(initialToken);
   const [ping, setPing] = useState<PingData | null>(null);
@@ -36,7 +49,7 @@ export function SheetConnectForm({ initialUrl = '', initialToken = '', choosePer
     const data = await pingSheet(url, token);
     const current = (await getSettings()).person;
     setPing(data);
-    setPerson(current && data.people.includes(current) ? current : null);
+    setPerson(preselectPerson && current && data.people.includes(current) ? current : null);
     return data;
   });
 
@@ -57,7 +70,8 @@ export function SheetConnectForm({ initialUrl = '', initialToken = '', choosePer
   const runTest = test.run;
   const autoTested = useRef(false);
   useEffect(() => {
-    if (autoTest && !autoTested.current && initialUrl && initialToken) {
+    // Pinging reveals the phone to whoever runs the URL, so only ever automatic for Apps Script.
+    if (autoTest && !autoTested.current && initialUrl && initialToken && isAppsScriptUrl(initialUrl)) {
       autoTested.current = true;
       void runTest();
     }
@@ -73,6 +87,8 @@ export function SheetConnectForm({ initialUrl = '', initialToken = '', choosePer
   };
 
   const hint = sheetUrlHint(url);
+  // Loud only once a whole address is there (host and path), not while it's being typed.
+  const foreignHost = /^https:\/\/[^/\s]+\/\S*$/i.test(url.trim()) && !isAppsScriptUrl(url);
   const canTest = url.trim().length > 0 && token.trim().length > 0;
   const canSave = ping !== null && (!choosePerson || person !== null);
 
@@ -87,8 +103,9 @@ export function SheetConnectForm({ initialUrl = '', initialToken = '', choosePer
         autoCorrect={false}
         keyboardType="url"
         textContentType="URL"
-        helper={hint ?? 'From the sheet: Diced menu → Show app connection info.'}
+        helper={foreignHost ? 'From the sheet: Diced menu → Show app connection info.' : (hint ?? 'From the sheet: Diced menu → Show app connection info.')}
       />
+      {foreignHost ? <Notice tone="danger" title="Not a Google Apps Script address" message={hint ?? ''} /> : null}
       <TextField
         label="App token"
         value={token}
@@ -110,7 +127,11 @@ export function SheetConnectForm({ initialUrl = '', initialToken = '', choosePer
 
       {ping ? (
         <View style={styles.result}>
-          <Notice tone="success" title="Connected" message={`${ping.spreadsheetName} · plan ${ping.startDate} → ${ping.eventDate}`} />
+          <Notice
+            tone={foreignHost ? 'warning' : 'success'}
+            title={`Reached ${describeSheetUrl(url)}`}
+            message={`It reports the sheet “${ping.spreadsheetName}”, plan ${ping.startDate} → ${ping.eventDate}. Entries you approve will be sent there.`}
+          />
           {ping.schemaVersion !== APP_SCHEMA_VERSION ? (
             <Notice
               tone="warning"

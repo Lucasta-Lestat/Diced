@@ -4,9 +4,12 @@ import { words } from './text';
 
 export const DEFAULT_LIBRARY_CANDIDATES = 30;
 
+/** Uses known to the sheet plus this phone's not yet synced ones. */
+const totalUses = (item: LibraryItem) => item.uses + (item.pendingUses ?? 0);
+
 function byUse(a: LibraryItem, b: LibraryItem): number {
   return (
-    b.uses - a.uses ||
+    totalUses(b) - totalUses(a) ||
     b.updatedAt - a.updatedAt ||
     a.name.localeCompare(b.name) ||
     (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)

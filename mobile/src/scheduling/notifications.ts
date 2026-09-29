@@ -67,8 +67,15 @@ export async function requestNotificationPermission(): Promise<boolean> {
   return next.granted || next.ios?.status === Notifications.IosAuthorizationStatus.PROVISIONAL;
 }
 
-/** (Re)schedule the weekly "process your week" reminder → data.url = 'diced://process-week'. */
+/**
+ * (Re)schedule the weekly "process your week" reminder → data.url = 'diced://process-week'.
+ * In manual mode a run reads no photos, so there is no reminder: it is removed instead.
+ */
 export async function scheduleWeeklyReminder(settings: AppSettings): Promise<void> {
+  if (settings.classificationMode === 'manual') {
+    await cancelWeeklyReminder();
+    return;
+  }
   await ensureAndroidChannel();
   await cancelWeeklyReminder();
   await Notifications.scheduleNotificationAsync({

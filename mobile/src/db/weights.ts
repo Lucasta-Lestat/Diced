@@ -109,6 +109,33 @@ export async function markWeightsSynced(entries: { id: string; updatedAt: number
   });
 }
 
+/**
+ * Marks entries sync_error with `message`, but only those not changed since they were read for
+ * the sync (same updatedAt): an entry rejected or edited while the request was in flight keeps
+ * its new state. Returns # marked.
+ */
+export async function markWeightsSyncError(entries: { id: string; updatedAt: number }[], message: string): Promise<number> {
+  if (entries.length === 0) return 0;
+  return withTransaction(async (db) => {
+    const now = Date.now();
+    let marked = 0;
+    for (const e of entries) {
+      const r = await db.runAsync(
+        `UPDATE weight_entries SET status = 'sync_error', updated_at = ?,
+           data = json_set(data, '$.status', 'sync_error', '$.updatedAt', ?, '$.syncError', ?)
+         WHERE id = ? AND updated_at = ?`,
+        now,
+        now,
+        message,
+        e.id,
+        e.updatedAt,
+      );
+      marked += r.changes;
+    }
+    return marked;
+  });
+}
+
 export async function deleteWeightEntry(id: string): Promise<void> {
   const db = await getDb();
   await db.runAsync('DELETE FROM weight_entries WHERE id = ?', id);

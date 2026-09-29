@@ -11,14 +11,16 @@ import {
   listMeals,
   listPendingSheetDeletesWithKind,
   markMealsSynced,
-  setMealStatus,
+  markMealsSyncError,
   type SheetDeleteKind,
 } from '../db/meals';
-import { getWeightEntry, listWeightEntries, markWeightsSynced, setWeightStatus } from '../db/weights';
+import { getWeightEntry, listWeightEntries, markWeightsSynced, markWeightsSyncError } from '../db/weights';
 import { isValidLocalDate, mondayOf, toLocalDate } from '../lib/dates';
 import { errorMessage, logger } from '../lib/log';
-import type { EntryStatus, MealEntry, WeightEntry } from '../types';
-import type { SheetMealRow, SheetSummary, SheetWeightRow } from './contract';
+import { MAX_MACRO_G, MAX_MEAL_KCAL } from '../pipeline/confidence';
+import { isPlausibleLb, MAX_PLAUSIBLE_LB, MIN_PLAUSIBLE_LB } from '../pipeline/weights';
+import type { EntryStatus, LibraryItem, MealEntry, WeightEntry } from '../types';
+import type { SheetLibraryItem, SheetMealRow, SheetSummary, SheetWeightRow } from './contract';
 import { libraryItemFromRow, libraryItemToRow, mealEntryToRow, weightEntryToRow } from './mapping';
 import { getSheetInfo, getSheetsClient, refreshSheetInfo, SheetsApiError, type SheetsClient } from './sheetsClient';
 
@@ -56,12 +58,14 @@ let inFlight: Promise<SyncResult> | null = null;
  * 1) upsert approved/sync_error weight entries → synced (or sync_error with message)
  * 2) upsert approved/sync_error meals → synced
  * 3) delete meals queued via addPendingSheetDelete
- * 4) push unsynced library items, then pull the whole library (mergeLibraryFromSheet)
+ * 4) pull the whole library (mergeLibraryFromSheet), then push unsynced items and uses
  * Batches of ≤ 50 rows per request.
  *
- * A failed batch marks its entries sync_error and the sync goes on, except after a
- * connection-level failure (network/timeout, unauthorized, bad response), where the
- * remaining requests are skipped because they would fail the same way.
+ * A failed batch marks its entries sync_error (unless they changed while the request was in
+ * flight) and the sync goes on, except after a connection-level failure (network/timeout,
+ * unauthorized, bad response), where the remaining requests are skipped because they would fail
+ * the same way. Rows outside the sheet's bounds are caught here, one entry at a time, instead of
+ * failing their whole batch on every sync.
  * Throws SheetsApiError('not_configured') when the sheet isn't connected.
  */
 export async function syncNow(): Promise<SyncResult> {
@@ -123,11 +127,16 @@ function recordFailure(ctx: SyncContext, what: string, e: unknown): string {
   return message;
 }
 
-/** Maps entries to rows; entries that can't be mapped are marked sync_error right away. */
-async function toRows<E extends { id: string }, R>(
+type Versioned = { id: string; updatedAt: number };
+
+/**
+ * Maps entries to rows; entries that can't be mapped (or would be rejected by the sheet) are
+ * marked sync_error right away, on their own.
+ */
+async function toRows<E extends Versioned, R>(
   entries: E[],
   map: (e: E) => R,
-  markError: (id: string, message: string) => Promise<void>,
+  markError: (entries: Versioned[], message: string) => Promise<unknown>,
   ctx: SyncContext,
   what: string,
 ): Promise<{ entry: E; row: R }[]> {
@@ -138,42 +147,72 @@ async function toRows<E extends { id: string }, R>(
     } catch (e) {
       const message = errorMessage(e);
       ctx.result.errors.push(`${what}: ${message}`);
-      await markError(entry.id, message);
+      await markError([versionOf(entry)], message);
     }
   }
   return ready;
 }
 
+function versionOf(entry: Versioned): Versioned {
+  return { id: entry.id, updatedAt: entry.updatedAt };
+}
+
+const kcalText = (n: number) => Math.round(n).toLocaleString('en-US');
+
+/** The sheet's bounds (apps-script validateList_), checked per entry before sending. */
+function checkedWeightRow(entry: WeightEntry): SheetWeightRow {
+  const row = weightEntryToRow(entry);
+  if (!isPlausibleLb(row.weightLb)) {
+    throw new Error(`${entry.localDate}: ${row.weightLb} lb is outside ${MIN_PLAUSIBLE_LB}–${MAX_PLAUSIBLE_LB} lb — correct the weigh-in.`);
+  }
+  return row;
+}
+
+function checkMacroBounds(row: { kcal: number; proteinG: number; carbsG: number; fatG: number }, label: string): void {
+  if (!(row.kcal >= 0 && row.kcal <= MAX_MEAL_KCAL)) {
+    throw new Error(`${label}: ${kcalText(row.kcal)} kcal is outside 0–${kcalText(MAX_MEAL_KCAL)} — correct it.`);
+  }
+  for (const [name, grams] of [['protein', row.proteinG], ['carbs', row.carbsG], ['fat', row.fatG]] as const) {
+    if (!(grams >= 0 && grams <= MAX_MACRO_G)) {
+      throw new Error(`${label}: ${Math.round(grams)} g ${name} is outside 0–${kcalText(MAX_MACRO_G)} g — correct it.`);
+    }
+  }
+}
+
+function checkedMealRow(meal: MealEntry): SheetMealRow {
+  const row = mealEntryToRow(meal);
+  checkMacroBounds(row, `${meal.localDate} ${row.description}`);
+  return row;
+}
+
 async function pushWeights(ctx: SyncContext): Promise<void> {
   const entries = await listWeightEntries({ statuses: PENDING });
-  const markError = (id: string, m: string) => setWeightStatus(id, 'sync_error', m);
-  const ready = await toRows<WeightEntry, SheetWeightRow>(entries, weightEntryToRow, markError, ctx, 'Weight Log');
+  const ready = await toRows<WeightEntry, SheetWeightRow>(entries, checkedWeightRow, markWeightsSyncError, ctx, 'Weight Log');
   for (const batch of batches(ready)) {
     if (ctx.halted) return;
     try {
       await ctx.client.call('upsertWeights', { entries: batch.map((b) => b.row) });
-      await markWeightsSynced(batch.map((b) => ({ id: b.entry.id, updatedAt: b.entry.updatedAt })));
+      await markWeightsSynced(batch.map((b) => versionOf(b.entry)));
       ctx.result.weightsSynced += batch.length;
     } catch (e) {
       const message = recordFailure(ctx, 'Weight Log', e);
-      for (const b of batch) await markError(b.entry.id, message);
+      await markWeightsSyncError(batch.map((b) => versionOf(b.entry)), message);
     }
   }
 }
 
 async function pushMeals(ctx: SyncContext): Promise<void> {
   const meals = await listMeals({ statuses: PENDING });
-  const markError = (id: string, m: string) => setMealStatus(id, 'sync_error', m);
-  const ready = await toRows<MealEntry, SheetMealRow>(meals, mealEntryToRow, markError, ctx, 'Food Log');
+  const ready = await toRows<MealEntry, SheetMealRow>(meals, checkedMealRow, markMealsSyncError, ctx, 'Food Log');
   for (const batch of batches(ready)) {
     if (ctx.halted) return;
     try {
       await ctx.client.call('upsertMeals', { entries: batch.map((b) => b.row) });
-      await markMealsSynced(batch.map((b) => ({ id: b.entry.id, updatedAt: b.entry.updatedAt })));
+      await markMealsSynced(batch.map((b) => versionOf(b.entry)));
       ctx.result.mealsSynced += batch.length;
     } catch (e) {
       const message = recordFailure(ctx, 'Food Log', e);
-      for (const b of batch) await markError(b.entry.id, message);
+      await markMealsSyncError(batch.map((b) => versionOf(b.entry)), message);
     }
   }
 }
@@ -222,30 +261,53 @@ async function pushDeletes(ctx: SyncContext): Promise<void> {
   }
 }
 
+/** The row pushed for a library item: the sheet's use count plus this phone's pending uses. */
+function libraryPushRow(item: LibraryItem): SheetLibraryItem {
+  const row = libraryItemToRow({ ...item, uses: item.uses + (item.pendingUses ?? 0) });
+  checkMacroBounds(row, `Usual meal "${row.name}"`);
+  return row;
+}
+
+/**
+ * Pull first, then push. The pull brings in the other phone's edits and use counts, so a push
+ * never writes a stale copy over a newer row: this phone's own edits survive the merge only when
+ * they are newer, and its uses are sent as the sheet's count plus the ones counted here.
+ */
 async function syncLibrary(ctx: SyncContext): Promise<void> {
-  if (ctx.halted) return;
-  const unsynced = await listUnsyncedLibrary();
-  for (const batch of batches(unsynced)) {
-    if (ctx.halted) return;
-    try {
-      await ctx.client.call('upsertLibrary', { items: batch.map(libraryItemToRow) });
-      await markLibraryItemsSynced(batch.map((i) => ({ id: i.id, updatedAt: i.updatedAt })));
-      ctx.result.libraryPushed += batch.length;
-    } catch (e) {
-      recordFailure(ctx, 'Food Library', e);
-    }
-  }
   if (ctx.halted) return;
   try {
     const { items } = await ctx.client.call('listLibrary', {});
     const pulled = items
       .map(libraryItemFromRow)
       .filter((i) => i.name && !ctx.pendingLibraryDeletes.has(i.id));
-    // Unsynced local items that are newer survive the merge, so pulling after a failed push is safe.
+    // Unsynced local items that are newer survive the merge; pending uses are kept.
     await mergeLibraryFromSheet(pulled);
     ctx.result.libraryPulled = pulled.length;
   } catch (e) {
+    // Without a fresh copy of the sheet a push could overwrite newer rows; try again next sync.
     recordFailure(ctx, 'Food Library', e);
+    return;
+  }
+  const unsynced = await listUnsyncedLibrary();
+  const ready: { item: LibraryItem; row: SheetLibraryItem }[] = [];
+  for (const item of unsynced) {
+    try {
+      ready.push({ item, row: libraryPushRow(item) });
+    } catch (e) {
+      ctx.result.errors.push(`Food Library: ${errorMessage(e)}`);
+    }
+  }
+  for (const batch of batches(ready)) {
+    if (ctx.halted) return;
+    try {
+      await ctx.client.call('upsertLibrary', { items: batch.map((b) => b.row) });
+      await markLibraryItemsSynced(
+        batch.map(({ item }) => ({ id: item.id, updatedAt: item.updatedAt, pendingUses: item.pendingUses ?? 0 })),
+      );
+      ctx.result.libraryPushed += batch.length;
+    } catch (e) {
+      recordFailure(ctx, 'Food Library', e);
+    }
   }
 }
 
@@ -255,6 +317,8 @@ async function syncLibrary(ctx: SyncContext): Promise<void> {
 
 export interface CachedSummary extends SheetSummary {
   fetchedAt: number;
+  /** The sheet web-app URL it was fetched from, so another sheet's numbers are never shown. */
+  url?: string;
 }
 
 /**
@@ -277,14 +341,15 @@ export async function refreshSummary(): Promise<CachedSummary | null> {
   const from = isValidLocalDate(info.startDate) ? info.startDate : mondayOf(today);
   const to = today < from ? from : today;
   const summary = await client.call('getSummary', { person: settings.person, from, to });
-  const cached: CachedSummary = { ...summary, fetchedAt: Date.now() };
+  const cached: CachedSummary = { ...summary, fetchedAt: Date.now(), url: settings.sheetWebAppUrl?.trim() ?? '' };
   await kvSet(SUMMARY_KEY, cached);
   return cached;
 }
 
-/** Last cached summary (no network); null if none or it belongs to another person. */
+/** Last cached summary (no network); null if none, or it belongs to another person or another sheet URL. */
 export async function getCachedSummary(): Promise<CachedSummary | null> {
   const [cached, settings] = await Promise.all([kvGet<CachedSummary>(SUMMARY_KEY), getSettings()]);
   if (!cached || cached.person !== settings.person) return null;
+  if (!settings.sheetWebAppUrl || cached.url !== settings.sheetWebAppUrl.trim()) return null;
   return cached;
 }

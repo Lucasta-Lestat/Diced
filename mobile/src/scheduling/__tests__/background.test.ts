@@ -118,11 +118,23 @@ describe('dueAutoRun', () => {
     expect(dueAutoRun(settings({ person: null }), now)).toBeNull();
     expect(dueAutoRun(settings({ sheetWebAppUrl: null }), now)).toBeNull();
   });
+
+  it('never runs before onboarding (and its privacy step) is finished', () => {
+    // Sheet + person come from the connect link / early onboarding steps; the default mode is automatic.
+    expect(dueAutoRun(settings({ onboardingComplete: false }), now)).toBeNull();
+  });
 });
 
 describe('runBackgroundTask', () => {
   it('does nothing when the sheet is not configured', async () => {
     mockGetSettings.mockResolvedValue(settings({ sheetWebAppUrl: null }));
+    await expect(runBackgroundTask()).resolves.toBe(SUCCESS);
+    expect(mockProcess).not.toHaveBeenCalled();
+    expect(mockSync).not.toHaveBeenCalled();
+  });
+
+  it('does nothing before onboarding is finished, even with a sheet and person set', async () => {
+    mockGetSettings.mockResolvedValue(settings({ onboardingComplete: false, lastAutoRunAt: null }));
     await expect(runBackgroundTask()).resolves.toBe(SUCCESS);
     expect(mockProcess).not.toHaveBeenCalled();
     expect(mockSync).not.toHaveBeenCalled();

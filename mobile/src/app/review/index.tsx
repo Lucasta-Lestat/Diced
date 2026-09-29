@@ -20,6 +20,7 @@ import {
   Screen,
   SectionHeader,
   useAutoRunState,
+  useOnSyncDone,
   WeightCard,
 } from '../../ui/components';
 import { requestSync } from '../../ui/autoRun';
@@ -65,6 +66,8 @@ export default function ReviewQueue() {
   useFocusRefresh(queue.reload);
 
   const reload = queue.reload;
+  // Approve / reject sync a few seconds later: refresh the waiting count and any sync errors.
+  useOnSyncDone(reload);
   const autoPhase = useAutoRunState().phase;
   useEffect(() => {
     if (autoPhase === 'done') void reload();

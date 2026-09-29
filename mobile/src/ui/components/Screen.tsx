@@ -1,7 +1,10 @@
-import type { ReactNode } from 'react';
+import { useIsFocused } from 'expo-router';
+import { useEffect, useState, type ReactNode } from 'react';
 import { Platform, RefreshControl, ScrollView, StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { clearFooterInset, newFooterKey, setFooterInset } from '../bannerInset';
 import { colors, spacing } from '../theme';
+import { BANNER_CLEARANCE, useAutoRunBannerShown } from './AutoRunBanner';
 
 export interface ScreenProps {
   children: ReactNode;
@@ -15,11 +18,26 @@ export interface ScreenProps {
 
 /**
  * Scrolling page body. The stack header already covers the top inset, so only the bottom
- * (home indicator / gesture bar) is padded here.
+ * (home indicator / gesture bar) is padded here. While the floating auto-run banner is shown, the
+ * content gets extra bottom room, and a pinned footer reports its height so the banner sits above
+ * it instead of covering its buttons.
  */
 export function Screen({ children, onRefresh, refreshing = false, footer, contentStyle }: ScreenProps) {
   const insets = useSafeAreaInsets();
-  const bottomPad = spacing.xl + (footer ? 0 : insets.bottom);
+  const bannerShown = useAutoRunBannerShown();
+  const focused = useIsFocused();
+  const [footerKey] = useState(newFooterKey);
+  const [footerHeight, setFooterHeight] = useState(0);
+  const hasFooter = Boolean(footer);
+
+  // Only the focused screen's footer counts (screens below it in the stack stay mounted).
+  useEffect(() => {
+    if (!hasFooter || !focused) return;
+    setFooterInset(footerKey, footerHeight);
+    return () => clearFooterInset(footerKey);
+  }, [footerKey, footerHeight, focused, hasFooter]);
+
+  const bottomPad = spacing.xl + (footer ? 0 : insets.bottom) + (bannerShown ? BANNER_CLEARANCE : 0);
   return (
     <View style={styles.root}>
       <ScrollView
@@ -35,7 +53,11 @@ export function Screen({ children, onRefresh, refreshing = false, footer, conten
         }>
         {children}
       </ScrollView>
-      {footer ? <View style={[styles.footer, { paddingBottom: spacing.md + insets.bottom }]}>{footer}</View> : null}
+      {footer ? (
+        <View style={[styles.footer, { paddingBottom: spacing.md + insets.bottom }]} onLayout={(e) => setFooterHeight(e.nativeEvent.layout.height)}>
+          {footer}
+        </View>
+      ) : null}
     </View>
   );
 }

@@ -10,7 +10,7 @@ import type {
 import type { Macros } from '../types';
 import { assertNotRefused, getAnthropic, resolveModel, toAiError } from './client';
 import { RESTAURANT_SYSTEM, restaurantUserText } from './prompts';
-import { type AiCallOptions, baseParams, systemBlocks } from './request';
+import { type AiCallOptions, baseParams, REQUEST_TIMEOUT_BY_EFFORT, systemBlocks } from './request';
 import { toPublishedNutrition } from './schemas';
 
 export interface PublishedNutrition {
@@ -64,7 +64,8 @@ async function send(client: Anthropic, model: string, messages: BetaMessageParam
         tool_choice: { type: 'auto' },
         output_config: { effort: 'medium' },
       },
-      { signal: opts.signal },
+      // Server-side searches add to the turn; a very long one comes back as pause_turn instead.
+      { signal: opts.signal, timeout: REQUEST_TIMEOUT_BY_EFFORT.medium },
     );
   } catch (e) {
     throw toAiError(e, model);

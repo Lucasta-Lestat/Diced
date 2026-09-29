@@ -37,6 +37,11 @@ export const TREND_MAX_DIFF_FRACTION = 0.025;
 export const TREND_HISTORY_DAYS = 7;
 /** Readings this close to the first morning reading count as one weigh-in (a retake). */
 export const RETAKE_WINDOW_MS = 10 * 60_000;
+/**
+ * The morning weigh-in window opens here: a reading just after midnight is the previous
+ * evening's (after dinner, typically heavier), as meal slots treat 00:00–04:00 too.
+ */
+export const MORNING_START_HOUR = 4;
 
 /** Entries the user already accepted; new readings never change them. */
 export const PROTECTED_STATUSES: readonly EntryStatus[] = ['approved', 'synced', 'sync_error'];
@@ -58,7 +63,8 @@ function byTakenAt(a: WeightCandidate, b: WeightCandidate): number {
 }
 
 function isMorning(c: WeightCandidate, cutoffHour: number): boolean {
-  return localHour(c.takenAt) < cutoffHour;
+  const hour = localHour(c.takenAt);
+  return hour >= MORNING_START_HOUR && hour < cutoffHour;
 }
 
 export function sourceForAsset(assetId: string | null): WeightEntry['source'] {
@@ -67,7 +73,7 @@ export function sourceForAsset(assetId: string | null): WeightEntry['source'] {
 }
 
 /**
- * The official reading: the earliest morning (before the cutoff) reading, else the earliest of
+ * The official reading: the earliest morning (04:00 until the cutoff) reading, else the earliest of
  * the day. A retake within 10 minutes of it with a clearer display (higher read confidence)
  * wins, since people re-snap a blurry scale. Implausible values are only chosen when there is
  * nothing else.
@@ -183,6 +189,12 @@ function acceptedHistory(
   return [...fromExisting, ...recent];
 }
 
+/** The reading the user picked in review, if it is still among the day's readings. */
+function userChoice(previous: WeightEntry | undefined, candidates: WeightCandidate[]): WeightCandidate | null {
+  if (!previous?.chosenByUser || previous.status !== 'needs_review') return null;
+  return candidates.find((c) => c.assetId === previous.chosenAssetId) ?? null;
+}
+
 function buildEntry(
   person: PersonLabel,
   date: LocalDate,
@@ -191,7 +203,9 @@ function buildEntry(
   history: { localDate: LocalDate; valueLb: number }[],
   opts: BuildWeightOptions,
 ): WeightEntry | null {
-  const chosen = chooseReading(candidates, opts.morningCutoffHour);
+  // A reading the user chose by hand stays chosen; new readings only update the flags.
+  const kept = userChoice(previous, candidates);
+  const chosen = kept ?? chooseReading(candidates, opts.morningCutoffHour);
   if (!chosen) return null;
   const { flags, confidence } = assessReading(candidates, chosen, history, opts);
   return {
@@ -209,12 +223,14 @@ function buildEntry(
     status: 'needs_review',
     syncError: null,
     updatedAt: opts.now,
+    ...(kept ? { chosenByUser: true } : {}),
   };
 }
 
 /**
- * For each day: choose the earliest reading before the morning cutoff (else the earliest
- * of the day); flags: `multiple_readings` (spread > 0.6 lb), `not_morning`,
+ * For each day: choose the earliest reading between 04:00 and the morning cutoff (else the
+ * earliest of the day) — unless the user picked a reading by hand while the day was in review,
+ * which is kept; flags: `multiple_readings` (spread > 0.6 lb), `not_morning`,
  * `low_read_confidence`, `differs_from_trend` (> 4 lb or > 2.5 % from the median of the
  * last 7 accepted days), `unit_converted`. Confidence = min(read confidence, trend check).
  * Existing entries that are approved/synced are never overwritten (returned unchanged);

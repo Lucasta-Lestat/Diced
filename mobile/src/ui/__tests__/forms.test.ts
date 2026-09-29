@@ -1,7 +1,10 @@
 /// <reference types="jest" />
 import {
+  describeSheetUrl,
   firstParam,
+  isAppsScriptUrl,
   isValidTime,
+  keyTestAllowsSave,
   macrosToInputs,
   numberToInput,
   parseDateInput,
@@ -13,6 +16,7 @@ import {
   pathFromDeepLink,
   recentDates,
   sheetUrlHint,
+  sheetUrlParts,
   slotForHour,
 } from '../forms';
 
@@ -130,7 +134,59 @@ describe('deep links and params', () => {
     expect(sheetUrlHint('https://script.google.com/macros/s/abc/exec')).toBeNull();
     expect(sheetUrlHint('http://script.google.com/macros/s/abc/exec')).toMatch(/https/);
     expect(sheetUrlHint('https://script.google.com/macros/s/abc/dev')).toMatch(/\/dev/);
-    expect(sheetUrlHint('https://example.com')).toMatch(/\/exec/);
+    expect(sheetUrlHint('https://script.google.com/macros/s/abc')).toMatch(/\/exec/);
+    expect(sheetUrlHint('https://script.google.com/macros/s/abc/exec?x=1')).toMatch(/exactly as the sheet shows it/);
+    expect(sheetUrlHint('https://script.google.com/a/macros/example.com/s/abc/exec')).toBeNull();
     expect(sheetUrlHint('')).toBeNull();
+  });
+
+  it('warns about any host other than Google Apps Script', () => {
+    expect(sheetUrlHint('https://evil.example/exec')).toMatch(/evil\.example.*not Google Apps Script/);
+    expect(sheetUrlHint('https://script.google.com.evil.example/macros/s/abc/exec')).toMatch(/not Google Apps Script/);
+    // A user@ part can make a foreign host look like Google.
+    expect(sheetUrlHint('https://script.google.com@evil.example/macros/s/abc/exec')).toMatch(/evil\.example/);
+  });
+});
+
+describe('sheet URL parts', () => {
+  const ID = 'AKfycbx1234567890abcdefghijklmnopqrstuvwxyz9xQw';
+
+  it('extracts the host and deployment id', () => {
+    expect(sheetUrlParts(`https://script.google.com/macros/s/${ID}/exec`)).toEqual({ host: 'script.google.com', deploymentId: ID });
+    expect(sheetUrlParts(`https://script.google.com/a/macros/example.com/s/${ID}/exec?x=1`)).toEqual({ host: 'script.google.com', deploymentId: ID });
+    expect(sheetUrlParts('https://Evil.Example:8443/exec')).toEqual({ host: 'evil.example', deploymentId: null });
+    expect(sheetUrlParts('https://script.google.com@evil.example/exec')?.host).toBe('evil.example');
+    expect(sheetUrlParts('http://script.google.com/macros/s/x/exec')).toBeNull();
+    expect(sheetUrlParts('not a url')).toBeNull();
+  });
+
+  it('accepts only Apps Script hosts', () => {
+    expect(isAppsScriptUrl(`https://script.google.com/macros/s/${ID}/exec`)).toBe(true);
+    expect(isAppsScriptUrl('https://script.googleusercontent.com/macros/echo?x=1')).toBe(true);
+    expect(isAppsScriptUrl('https://evil.example/exec')).toBe(false);
+    expect(isAppsScriptUrl('https://script.google.com.evil.example/exec')).toBe(false);
+    expect(isAppsScriptUrl('')).toBe(false);
+  });
+
+  it('names destinations briefly for confirmations', () => {
+    expect(describeSheetUrl(`https://script.google.com/macros/s/${ID}/exec`)).toBe('script.google.com · deployment AKfycb…9xQw');
+    expect(describeSheetUrl('https://script.google.com/macros/s/short/exec')).toBe('script.google.com · deployment short');
+    expect(describeSheetUrl('https://evil.example/exec')).toBe('evil.example');
+  });
+});
+
+describe('keyTestAllowsSave', () => {
+  it('refuses only a rejected key', () => {
+    expect(keyTestAllowsSave({ ok: true, message: 'Connected' })).toBe(true);
+    expect(keyTestAllowsSave({ ok: false, message: 'x', kind: 'auth' })).toBe(false);
+    for (const kind of ['network', 'timeout', 'rate_limit', 'overloaded', 'permission', 'not_found']) {
+      expect(keyTestAllowsSave({ ok: false, message: 'x', kind })).toBe(true);
+    }
+  });
+
+  it('falls back to the rejected-key message when no kind is reported', () => {
+    expect(keyTestAllowsSave({ ok: false, message: 'Claude API key rejected — check that you copied the whole key.' })).toBe(false);
+    expect(keyTestAllowsSave({ ok: false, message: 'The key works, but model "x" was not found — check the model id in Settings.' })).toBe(true);
+    expect(keyTestAllowsSave({ ok: false, message: "Couldn't reach Claude — check your internet connection." })).toBe(true);
   });
 });

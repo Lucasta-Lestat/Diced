@@ -1,4 +1,4 @@
-export { AutoRunBanner, useAutoRunState } from './AutoRunBanner';
+export { AutoRunBanner, useAutoRunBannerShown, useAutoRunState, useOnSyncDone, useUiRun } from './AutoRunBanner';
 export { Badge, ConfidenceBadge, FlagBadge, StatusBadge } from './Badge';
 export { Button, type ButtonVariant } from './Button';
 export { Card } from './Card';

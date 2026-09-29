@@ -1,6 +1,6 @@
 /// <reference types="jest" />
 import { ImageManipulator } from 'expo-image-manipulator';
-import { makeThumbnail, prepareForModel } from '../images';
+import { DECODE_LIMIT, makeThumbnail, prepareForModel, prepareScaleImage } from '../images';
 
 interface FakeImage {
   width: number;
@@ -142,5 +142,64 @@ describe('prepareForModel', () => {
     });
     await expect(prepareForModel('file:///broken.jpg')).rejects.toThrow('cannot decode');
     expect(mockContexts[0].release).toHaveBeenCalled();
+  });
+});
+
+describe('prepareScaleImage', () => {
+  it("uses the model's full resolution for scale displays, capped at ~3.75 MP", async () => {
+    mockSources.set('ph://scale', { width: 4032, height: 3024 });
+    const out = await prepareScaleImage('ph://scale');
+    expect(mockContexts[0].resize).toHaveBeenCalledWith({ width: 2236 });
+    expect(out.width * out.height).toBeLessThanOrEqual(3_750_000);
+    expect(out.base64).toBe('b64-2236x1677-jpeg-0.8');
+  });
+
+  it('keeps a scale photo that already fits (more detail than a food photo)', async () => {
+    mockSources.set('file:///scale.jpg', { width: 2000, height: 1500 });
+    const out = await prepareScaleImage('file:///scale.jpg');
+    expect(mockContexts[0].resize).not.toHaveBeenCalled();
+    expect(out).toMatchObject({ width: 2000, height: 1500 });
+  });
+});
+
+describe('full-size decodes', () => {
+  it(`never has more than ${DECODE_LIMIT} images decoding at once, across callers`, async () => {
+    let open = 0;
+    let maxOpen = 0;
+    const real = jest.mocked(ImageManipulator.manipulate).getMockImplementation()!;
+    jest.mocked(ImageManipulator.manipulate).mockImplementation((uri) => {
+      open++;
+      maxOpen = Math.max(maxOpen, open);
+      const context = real(uri) as unknown as FakeContext;
+      const render = context.renderAsync.getMockImplementation()!;
+      context.renderAsync.mockImplementation(async () => {
+        await new Promise((r) => setTimeout(r, 2));
+        return render();
+      });
+      context.release.mockImplementation(() => {
+        open--;
+      });
+      return context as never;
+    });
+    for (let i = 0; i < 8; i++) mockSources.set(`ph://${i}`, { width: 4032, height: 3024 });
+
+    const outs = await Promise.all([
+      ...Array.from({ length: 6 }, (_, i) => makeThumbnail(`ph://${i}`)),
+      prepareForModel('ph://6'),
+      prepareScaleImage('ph://7'),
+    ]);
+
+    expect(outs).toHaveLength(8);
+    expect(maxOpen).toBe(DECODE_LIMIT);
+    expect(open).toBe(0);
+  });
+
+  it('frees the slot when a decode fails', async () => {
+    jest.mocked(ImageManipulator.manipulate).mockImplementationOnce(() => {
+      throw new Error('cannot load');
+    });
+    mockSources.set('ph://ok', { width: 100, height: 100 });
+    await expect(makeThumbnail('ph://bad')).rejects.toThrow('cannot load');
+    await expect(Promise.all(Array.from({ length: DECODE_LIMIT + 1 }, () => makeThumbnail('ph://ok')))).resolves.toHaveLength(DECODE_LIMIT + 1);
   });
 });

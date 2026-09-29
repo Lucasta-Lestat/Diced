@@ -1,11 +1,11 @@
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import { Alert, Platform, StyleSheet, View } from 'react-native';
-import { getSecret, setSecret, updateSettings } from '../config/settings';
+import { getSecret, getSettings, setSecret, updateSettings } from '../config/settings';
 import { lastRuns } from '../db/runs';
 import { getPhotoPermission, requestPhotoPermission, type PhotoPermission } from '../photos/scanner';
 import { backgroundTaskStatus, registerBackgroundTask } from '../scheduling/background';
-import { requestNotificationPermission, scheduleWeeklyReminder } from '../scheduling/notifications';
+import { requestNotificationPermission } from '../scheduling/notifications';
 import { getSheetInfo, refreshSheetInfo } from '../sync/sheetsClient';
 import { syncNow } from '../sync/syncQueue';
 import type { AppSettings } from '../types';
@@ -30,6 +30,7 @@ import {
 } from '../ui/components';
 import { relativeTime, runSummary, syncSummary } from '../ui/format';
 import { useAction, useAsync, useFocusRefresh, useNow, useSettings } from '../ui/hooks';
+import { armWeeklyReminder } from '../ui/reminder';
 import { spacing } from '../ui/theme';
 import { openSystemSettings } from '../ui/system';
 
@@ -57,9 +58,30 @@ export default function Settings() {
   const status = useAsync(loadStatus);
   useFocusRefresh(status.reload);
   const update = useAction((patch: Partial<AppSettings>) => updateSettings(patch));
+  // The weekly reminder follows the mode: manual mode reads no photos, so it has none.
+  const [reminderWarning, setReminderWarning] = useState<string | null>(null);
+  const changeMode = useAction(async (classificationMode: AppSettings['classificationMode']) => {
+    const next = await updateSettings({ classificationMode });
+    setReminderWarning(null);
+    try {
+      await armWeeklyReminder(next);
+    } catch (e) {
+      setReminderWarning(e instanceof Error ? e.message : String(e));
+    }
+  });
 
   if (!settings) return <Screen>{null}</Screen>;
-  const footer = update.error ? <ErrorBanner title="Couldn't save that setting" message={update.error} onDismiss={() => update.setError(null)} /> : undefined;
+  const saveError = update.error ?? changeMode.error;
+  const footer = saveError ? (
+    <ErrorBanner
+      title="Couldn't save that setting"
+      message={saveError}
+      onDismiss={() => {
+        update.setError(null);
+        changeMode.setError(null);
+      }}
+    />
+  ) : undefined;
 
   return (
     <Screen footer={footer} onRefresh={() => void status.reload()}>
@@ -87,8 +109,9 @@ export default function Settings() {
       <PrivacySection
         settings={settings}
         photos={status.data?.photos ?? null}
-        onMode={(classificationMode) => void update.run({ classificationMode })}
+        onMode={(classificationMode) => void changeMode.run(classificationMode)}
         onPermissionChanged={() => void status.reload()}
+        reminderWarning={reminderWarning}
       />
       <AccuracySection settings={settings} hasUsda={status.data?.hasUsda ?? false} update={(patch) => void update.run(patch)} onUsdaChanged={() => void status.reload()} />
       <NotificationsSection />
@@ -145,8 +168,9 @@ function ScheduleSection({
 }) {
   const save = useAction(async (s: Schedule) => {
     const next = await updateSettings({ scheduleWeekday: s.weekday, scheduleHour: s.hour, scheduleMinute: s.minute });
-    await scheduleWeeklyReminder(next);
+    await armWeeklyReminder(next);
   });
+  const manual = settings.classificationMode === 'manual';
   const schedule: Schedule = { weekday: settings.scheduleWeekday, hour: settings.scheduleHour, minute: settings.scheduleMinute };
   return (
     <>
@@ -167,7 +191,9 @@ function ScheduleSection({
           </Muted>
         ) : null}
       </Card>
-      {Platform.OS === 'ios' ? (
+      {manual ? (
+        <Muted>Manual mode: no photos are read on this schedule and there’s no weekly reminder. Switch to automatic below to use it.</Muted>
+      ) : Platform.OS === 'ios' ? (
         <Card title="iPhone automation">
           <ShortcutsHowTo weekday={settings.scheduleWeekday} hour={settings.scheduleHour} minute={settings.scheduleMinute} />
         </Card>
@@ -181,11 +207,13 @@ function PrivacySection({
   photos,
   onMode,
   onPermissionChanged,
+  reminderWarning,
 }: {
   settings: AppSettings;
   photos: PhotoPermission | null;
   onMode: (m: AppSettings['classificationMode']) => void;
   onPermissionChanged: () => void;
+  reminderWarning: string | null;
 }) {
   const ask = useAction(async () => {
     const result = await requestPhotoPermission();
@@ -207,9 +235,10 @@ function PrivacySection({
         />
         <Muted>
           {settings.classificationMode === 'cloud_thumbnails'
-            ? 'Small, EXIF-stripped thumbnails of the week’s photos (not screenshots or chat images) go to Claude to find scale and food photos; only those are then sent full-size to be read.'
+            ? 'Small, EXIF-stripped thumbnails of the week’s photos go to Claude to find scale and food photos; only those are then sent full-size to be read. Screenshots are skipped on the phone. Images saved from WhatsApp, Signal, Telegram, Messenger and similar apps are skipped when their file name or album shows it; photos saved from iMessage (or apps that don’t save into an album of their own) look like camera photos and may be sent as thumbnails.'
             : 'Nothing is scanned or sent automatically. Use Quick log to photograph or pick photos yourself.'}
         </Muted>
+        {reminderWarning ? <Notice tone="warning" title="Weekly reminder not scheduled" message={reminderWarning} /> : null}
         <Row label="Photo access" value={photos ? PERMISSION_TEXT[photos] : '—'} />
         {photos !== 'granted_all' ? (
           <Button variant="secondary" label={photos === 'undetermined' ? 'Allow photo access' : 'Open Settings'} onPress={() => void ask.run()} loading={ask.pending} />
@@ -322,13 +351,18 @@ function NotificationsSection() {
   const ask = useAction(async () => {
     const ok = await requestNotificationPermission();
     setGranted(ok);
-    if (!ok) openSystemSettings();
+    if (!ok) {
+      openSystemSettings();
+      return;
+    }
+    // A reminder that failed to schedule while notifications were off (e.g. during setup) is armed now.
+    await armWeeklyReminder(await getSettings());
   });
   return (
     <>
       <SectionHeader title="Notifications" />
       <Card>
-        <Muted>Used for the weekly reminder and “ready to review”.</Muted>
+        <Muted>Used for the weekly reminder (automatic mode) and “ready to review”.</Muted>
         <Button variant="secondary" label="Allow notifications" onPress={() => void ask.run()} loading={ask.pending} />
         {granted !== null ? <Notice tone={granted ? 'success' : 'warning'} message={granted ? 'Notifications are on.' : 'Notifications are off — turn them on in Settings.'} /> : null}
         <ErrorBanner message={ask.error} />

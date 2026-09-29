@@ -58,7 +58,10 @@ export interface MealEstimateRequest {
   signal?: AbortSignal;
 }
 
-/** Model estimate, then checked against USDA / Open Food Facts / published nutrition. */
+/**
+ * Model estimate, then checked against USDA / Open Food Facts / published nutrition. User notes
+ * and answers are authoritative, so a published whole-item figure never overrides them.
+ */
 export async function estimateAndReconcile(req: MealEstimateRequest): Promise<MealEstimate> {
   const estimate = await estimateMeal(
     {
@@ -72,7 +75,12 @@ export async function estimateAndReconcile(req: MealEstimateRequest): Promise<Me
     },
     { signal: req.signal },
   );
-  return reconcileEstimate(estimate, { useUsda: true, webLookupForRestaurants: req.settings.webLookupForRestaurants });
+  return reconcileEstimate(estimate, {
+    useUsda: true,
+    webLookupForRestaurants: req.settings.webLookupForRestaurants,
+    userContext: req.notes.trim() !== '' || req.answers.some((a) => a.answer.trim() !== ''),
+    signal: req.signal,
+  });
 }
 
 /** The model found nothing to eat in the photos (a misclassified photo). */

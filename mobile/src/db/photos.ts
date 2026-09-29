@@ -79,6 +79,19 @@ export async function getPhoto(assetId: string): Promise<PhotoRecord | null> {
   return row ? fromRow(row) : null;
 }
 
+/**
+ * Hand-picked photos stored under a `picked:<file name>` id (no media-library id) taken in
+ * [startMs, endMs], so a scan can skip the same photo found again in the library.
+ */
+export async function listPickedPhotos(startMs: number, endMs: number): Promise<PhotoRecord[]> {
+  const db = await getDb();
+  const rows = await db.getAllAsync<PhotoRow>(
+    `SELECT ${COLUMNS} FROM photos WHERE substr(asset_id, 1, 7) = 'picked:' AND creation_time >= ? AND creation_time <= ? ORDER BY creation_time`,
+    [startMs, endMs],
+  );
+  return rows.map(fromRow);
+}
+
 /** Records for the known ids, in the order of `assetIds` (unknown ids are skipped). */
 export async function getPhotos(assetIds: string[]): Promise<PhotoRecord[]> {
   if (assetIds.length === 0) return [];

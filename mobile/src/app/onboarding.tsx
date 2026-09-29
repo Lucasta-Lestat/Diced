@@ -1,10 +1,9 @@
-import { useRouter } from 'expo-router';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Platform, StyleSheet, Text, View } from 'react-native';
 import { getSecret, updateSettings } from '../config/settings';
 import { requestPhotoPermission, type PhotoPermission } from '../photos/scanner';
 import { registerBackgroundTask } from '../scheduling/background';
-import { requestNotificationPermission, scheduleWeeklyReminder } from '../scheduling/notifications';
+import { requestNotificationPermission } from '../scheduling/notifications';
 import { getSheetInfo } from '../sync/sheetsClient';
 import type { AppSettings, ClassificationMode } from '../types';
 import {
@@ -28,6 +27,7 @@ import {
 } from '../ui/components';
 import { formatClock, weekdayName } from '../ui/format';
 import { useAction, useAsync, useSettings } from '../ui/hooks';
+import { armWeeklyReminder } from '../ui/reminder';
 import { colors, spacing, type } from '../ui/theme';
 import { openSystemSettings } from '../ui/system';
 
@@ -124,11 +124,12 @@ function Welcome({ onNext }: { onNext: () => void }) {
 }
 
 function SheetStep({ settings, onNext }: { settings: AppSettings; onNext: () => void }) {
-  const router = useRouter();
   return (
     <StepFrame title="Connect the sheet">
-      <Body>Easiest: open the diced://connect link from the sheet on this phone — it fills everything in. Or paste the details here.</Body>
-      <Button variant="secondary" label="I have a link — open the connect screen" onPress={() => router.push('/connect')} />
+      <Body>
+        Easiest: in the sheet choose Diced → Show app connection info, then scan its QR code with this phone’s camera or tap the
+        diced://connect link (for example in an email to yourself). It fills everything in. Or paste the URL and token here.
+      </Body>
       <Card>
         <SheetConnectForm initialUrl={settings.sheetWebAppUrl ?? ''} choosePerson={false} saveLabel="Save and continue" onSaved={onNext} />
       </Card>
@@ -227,7 +228,10 @@ function NotificationsStep({ onNext }: { onNext: () => void }) {
   const ask = useAction(async () => setGranted(await requestNotificationPermission()));
   return (
     <StepFrame title="Notifications">
-      <Body>Diced sends a weekly reminder to log your week and a note when new weigh-ins and meals are ready to review. Nothing else.</Body>
+      <Body>
+        Diced sends a weekly reminder to process your week (in automatic mode) and a note when new weigh-ins and meals are ready
+        to review. Nothing else.
+      </Body>
       {granted === true ? <Notice tone="success" message="Notifications are on." /> : null}
       {granted === false ? <Notice tone="warning" message="Notifications are off. You can turn them on later in Settings." /> : null}
       <ErrorBanner message={ask.error} />
@@ -264,7 +268,8 @@ function PrivacyStep({ settings, onNext }: { settings: AppSettings; onNext: () =
         <Card title="Automatic (recommended)">
           <Bullets
             items={[
-              'Each run, Diced looks at the photos taken since the last run. Screenshots and images saved from messaging apps are skipped on the phone and never sent.',
+              'Each run, Diced looks at the photos taken since the last run. Screenshots are skipped on the phone and never sent.',
+              'Images saved from WhatsApp, Signal, Telegram, Messenger and similar apps are skipped when their file name or album shows it. Photos saved from iMessage (or apps that don’t save into an album of their own) look like camera photos and may be sent as small thumbnails.',
               'The rest are shrunk to small thumbnails and re-encoded, which strips EXIF metadata such as location, and sent to Claude to find scale and food photos.',
               'Only the scale and food photos are then sent at full size (also EXIF-stripped) to read the scale or estimate the meal.',
               'Nothing else is sent — no other photos, contacts or location.',
@@ -292,7 +297,10 @@ function ScheduleStep({ settings, onNext }: { settings: AppSettings; onNext: () 
   const [schedule, setSchedule] = useState<Schedule>({ weekday: settings.scheduleWeekday, hour: settings.scheduleHour, minute: settings.scheduleMinute });
   const [daily, setDaily] = useState(settings.processDaily);
   const [reminderWarning, setReminderWarning] = useState<string | null>(null);
+  // Manual mode reads no photos on a schedule: no weekly reminder, no Shortcuts automation.
+  const manual = settings.classificationMode === 'manual';
   const save = useAction(async () => {
+    setReminderWarning(null);
     const next = await updateSettings({
       scheduleWeekday: schedule.weekday,
       scheduleHour: schedule.hour,
@@ -301,33 +309,60 @@ function ScheduleStep({ settings, onNext }: { settings: AppSettings; onNext: () 
     });
     await registerBackgroundTask();
     try {
-      await scheduleWeeklyReminder(next);
+      await armWeeklyReminder(next);
     } catch (e) {
-      // Usually notifications are off; the Shortcut / background job still work.
+      // Usually notifications are off; the Shortcut / background job still work. Stay on this step
+      // so the warning is actually seen (the next step would unmount it).
       setReminderWarning(e instanceof Error ? e.message : String(e));
+      return;
     }
     onNext();
   });
   return (
     <StepFrame title="Weekly run">
-      <Body>
-        Pick when to process the week — for example Monday morning, after your weigh-in. The sheet’s weeks run Monday to
-        Sunday.
-      </Body>
-      <Card>
-        <ScheduleEditor value={schedule} onChange={setSchedule} />
-        <ToggleRow label="Also check for new photos daily" value={daily} onValueChange={setDaily} />
-      </Card>
-      {Platform.OS === 'ios' ? (
-        <Card title="Set up the iPhone automation">
-          <ShortcutsHowTo weekday={schedule.weekday} hour={schedule.hour} minute={schedule.minute} />
-        </Card>
+      {manual ? (
+        <Body>
+          Manual mode: nothing is processed on a schedule and there’s no weekly reminder. Log photos or type entries in Quick log
+          whenever you like. If you switch to automatic in Settings, you can pick the weekly run there.
+        </Body>
       ) : (
-        <Notice tone="info" message={`Android runs this in the background — every ${weekdayName(schedule.weekday)} around ${formatClock(schedule.hour, schedule.minute)}, with a notification when there's something to review.`} />
+        <>
+          <Body>
+            Pick when to process the week — for example Monday morning, after your weigh-in. The sheet’s weeks run Monday to
+            Sunday.
+          </Body>
+          <Card>
+            <ScheduleEditor value={schedule} onChange={setSchedule} />
+            <ToggleRow label="Also check for new photos daily" value={daily} onValueChange={setDaily} />
+          </Card>
+          {Platform.OS === 'ios' ? (
+            <Card title="Set up the iPhone automation">
+              <ShortcutsHowTo weekday={schedule.weekday} hour={schedule.hour} minute={schedule.minute} />
+            </Card>
+          ) : (
+            <Notice
+              tone="info"
+              message={`Android runs this in the background — usually within about 12 hours after ${weekdayName(schedule.weekday)} ${formatClock(schedule.hour, schedule.minute)}, or as soon as you open the app — with a notification when there's something to review.`}
+            />
+          )}
+        </>
       )}
-      {reminderWarning ? <Notice tone="warning" message={`Weekly reminder not scheduled: ${reminderWarning}`} /> : null}
+      {reminderWarning ? (
+        <Notice
+          tone="warning"
+          title="Weekly reminder not scheduled"
+          message={`${reminderWarning}\nTurn on notifications (Settings → Notifications) to get the reminder. You can continue without it.`}
+        />
+      ) : null}
       <ErrorBanner message={save.error} />
-      <Button label="Continue" onPress={() => void save.run()} loading={save.pending} />
+      {reminderWarning ? (
+        <>
+          <Button label="Continue anyway" onPress={onNext} />
+          <Button variant="secondary" label="Try again" onPress={() => void save.run()} loading={save.pending} />
+        </>
+      ) : (
+        <Button label="Continue" onPress={() => void save.run()} loading={save.pending} />
+      )}
     </StepFrame>
   );
 }
@@ -339,10 +374,14 @@ function DoneStep({ settings }: { settings: AppSettings }) {
       <Bullets
         items={[
           `Logging for ${settings.person ?? '—'}.`,
-          `Weekly run every ${weekdayName(settings.scheduleWeekday)} at ${formatClock(settings.scheduleHour, settings.scheduleMinute)}.`,
-          settings.classificationMode === 'cloud_thumbnails'
-            ? 'New photos are checked automatically; the first run looks back 8 days and starts right away.'
-            : 'Manual mode: use Quick log to add photos or type entries.',
+          ...(settings.classificationMode === 'cloud_thumbnails'
+            ? [
+                Platform.OS === 'android'
+                  ? `Weekly run after ${weekdayName(settings.scheduleWeekday)} ${formatClock(settings.scheduleHour, settings.scheduleMinute)} — usually within about 12 hours, or when you open the app.`
+                  : `Weekly run every ${weekdayName(settings.scheduleWeekday)} at ${formatClock(settings.scheduleHour, settings.scheduleMinute)}.`,
+                'New photos are checked automatically; the first run looks back 8 days and starts right away.',
+              ]
+            : ['Manual mode: use Quick log to add photos or type entries.']),
           'Review and approve entries; Sync writes them to the sheet.',
         ]}
       />

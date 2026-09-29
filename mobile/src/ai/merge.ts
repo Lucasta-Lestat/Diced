@@ -61,8 +61,10 @@ function scaleItems(items: FoodItem[], k: number): FoodItem[] {
 export function mergeSamples(samples: MealEstimate[]): MealEstimate {
   if (samples.length === 0) throw new Error('mergeSamples needs at least one estimate');
   const n = samples.length;
+  // Any sample seeing only leftovers is enough for the pipeline to look for the meal's earlier photos.
+  const leftovers = samples.some((s) => s.leftoversOnly) ? { leftoversOnly: true } : {};
   const withFood = samples.filter((s) => s.items.length > 0);
-  if (n === 1 || withFood.length === 0) return { ...samples[0], samples: n };
+  if (n === 1 || withFood.length === 0) return { ...samples[0], samples: n, ...leftovers };
 
   const mean = meanMacros(withFood);
   const rep = pickRepresentative(withFood, mean.kcal);
@@ -95,5 +97,6 @@ export function mergeSamples(samples: MealEstimate[]): MealEstimate {
     brand: rep.brand ?? withFood.find((s) => s.brand)?.brand ?? null,
     barcode: rep.barcode ?? withFood.find((s) => s.barcode)?.barcode ?? null,
     samples: n,
+    ...leftovers,
   };
 }

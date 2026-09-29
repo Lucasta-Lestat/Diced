@@ -106,6 +106,12 @@ export function weekdayShort(isoWeekday: number): string {
   return weekdayName(isoWeekday).slice(0, 3);
 }
 
+/** `rice`, `rice and chicken`, `rice, chicken and beans` */
+export function joinList(items: readonly string[]): string {
+  if (items.length <= 1) return items[0] ?? '';
+  return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+}
+
 export function plural(n: number, singular: string, pluralForm = `${singular}s`): string {
   return `${formatInt(n)} ${n === 1 ? singular : pluralForm}`;
 }

@@ -180,8 +180,12 @@ describe('syncNow', () => {
 
     const result = await syncNow();
 
-    expect(w.setWeightStatus).toHaveBeenCalledTimes(50);
-    expect(w.setWeightStatus).toHaveBeenCalledWith(ws[0].id, 'sync_error', 'Row 4: weightLb out of range');
+    // Guarded by updatedAt: an entry rejected or edited while the request was in flight keeps its state.
+    expect(w.markWeightsSyncError).toHaveBeenCalledTimes(1);
+    expect(w.markWeightsSyncError).toHaveBeenCalledWith(
+      ws.slice(0, 50).map((e) => ({ id: e.id, updatedAt: e.updatedAt })),
+      'Row 4: weightLb out of range',
+    );
     expect(w.markWeightsSynced).toHaveBeenCalledTimes(1);
     expect(w.markWeightsSynced.mock.calls[0][0]).toHaveLength(10);
     expect(result.weightsSynced).toBe(10);
@@ -192,7 +196,7 @@ describe('syncNow', () => {
   it('entries that cannot be mapped are marked sync_error and not sent', async () => {
     w.listWeightEntries.mockResolvedValue([weight(0, { valueLb: null }), weight(1)]);
     const result = await syncNow();
-    expect(w.setWeightStatus).toHaveBeenCalledWith(weight(0).id, 'sync_error', expect.stringContaining('no value'));
+    expect(w.markWeightsSyncError).toHaveBeenCalledWith([{ id: weight(0).id, updatedAt: weight(0).updatedAt }], expect.stringContaining('no value'));
     const sent = call.mock.calls.find((c) => c[0] === 'upsertWeights')![1].entries;
     expect(sent.map((r: { entryId: string }) => r.entryId)).toEqual([weight(1).id]);
     expect(result.weightsSynced).toBe(1);
@@ -211,8 +215,8 @@ describe('syncNow', () => {
     const result = await syncNow();
 
     expect(actions()).toEqual(['upsertWeights']);
-    expect(w.setWeightStatus).toHaveBeenCalledTimes(50);
-    expect(m.setMealStatus).not.toHaveBeenCalled();
+    expect(w.markWeightsSyncError.mock.calls[0][0]).toHaveLength(50);
+    expect(m.markMealsSyncError).not.toHaveBeenCalled();
     expect(lib.mergeLibraryFromSheet).not.toHaveBeenCalled();
     expect(result.errors).toEqual(["Weight Log: Couldn't reach the sheet: offline"]);
   });
@@ -223,7 +227,7 @@ describe('syncNow', () => {
       throw new SheetsApiError('Row 0: kcal out of range', 'bad_request');
     };
     const result = await syncNow();
-    expect(m.setMealStatus).toHaveBeenCalledWith('m1', 'sync_error', 'Row 0: kcal out of range');
+    expect(m.markMealsSyncError).toHaveBeenCalledWith([{ id: 'm1', updatedAt: 7 }], 'Row 0: kcal out of range');
     expect(m.markMealsSynced).not.toHaveBeenCalled();
     expect(result.errors).toEqual(['Food Log: Row 0: kcal out of range']);
   });
@@ -284,20 +288,59 @@ describe('syncNow', () => {
     expect(result.errors).toEqual(['Delete: boom']);
   });
 
-  it('pushes unsynced library items, then pulls and merges the sheet library', async () => {
+  it('pulls and merges the sheet library first, then pushes unsynced items', async () => {
     const unsynced = [libItem('l1', { updatedAt: 5 })];
     lib.listUnsyncedLibrary.mockResolvedValue(unsynced);
     handlers.listLibrary = () => ({ items: [sheetLib('l1', 'Oats'), sheetLib('', ''), sheetLib('l2', 'Chili')] });
 
     const result = await syncNow();
 
-    expect(actions()).toEqual(['upsertLibrary', 'listLibrary']);
-    expect(call.mock.calls[0][1].items[0]).toMatchObject({ entryId: 'l1', name: 'Item l1' });
-    expect(lib.markLibraryItemsSynced).toHaveBeenCalledWith([{ id: 'l1', updatedAt: 5 }]);
+    // Pulling first means a stale local copy never overwrites the other phone's newer edit.
+    expect(actions()).toEqual(['listLibrary', 'upsertLibrary']);
     const merged = lib.mergeLibraryFromSheet.mock.calls[0][0];
     expect(merged.map((i) => i.id)).toEqual(['l1', 'l2']);
     expect(merged.every((i) => i.synced)).toBe(true);
+    expect(lib.mergeLibraryFromSheet.mock.invocationCallOrder[0]).toBeLessThan(lib.listUnsyncedLibrary.mock.invocationCallOrder[0]);
+    expect(call.mock.calls[1][1].items[0]).toMatchObject({ entryId: 'l1', name: 'Item l1' });
+    expect(lib.markLibraryItemsSynced).toHaveBeenCalledWith([{ id: 'l1', updatedAt: 5, pendingUses: 0 }]);
     expect(result).toMatchObject({ libraryPushed: 1, libraryPulled: 2 });
+  });
+
+  it("adds this phone's uses to the sheet's count instead of overwriting it", async () => {
+    lib.listUnsyncedLibrary.mockResolvedValue([libItem('l1', { uses: 7, pendingUses: 2, synced: true, updatedAt: 5 })]);
+    await syncNow();
+    expect(call.mock.calls[1][1].items[0]).toMatchObject({ entryId: 'l1', uses: 9 });
+    expect(lib.markLibraryItemsSynced).toHaveBeenCalledWith([{ id: 'l1', updatedAt: 5, pendingUses: 2 }]);
+  });
+
+  it("doesn't push the library when the pull failed (it could overwrite newer rows)", async () => {
+    lib.listUnsyncedLibrary.mockResolvedValue([libItem('l1')]);
+    handlers.listLibrary = () => {
+      throw new SheetsApiError('Food Library tab is missing', 'internal');
+    };
+    const result = await syncNow();
+    expect(actions()).toEqual(['listLibrary']);
+    expect(result.errors).toEqual(['Food Library: Food Library tab is missing']);
+  });
+
+  it('marks an entry outside the sheet bounds on its own instead of failing its batch', async () => {
+    w.listWeightEntries.mockResolvedValue([weight(0, { valueLb: 18.5 }), weight(1)]);
+    m.listMeals.mockResolvedValue([
+      meal('typo', { final: { kcal: 12_400, proteinG: 30, carbsG: 50, fatG: 1_380 }, title: 'Stir fry' }),
+      meal('ok'),
+    ]);
+    lib.listUnsyncedLibrary.mockResolvedValue([libItem('big', { macros: { kcal: 20_000, proteinG: 1, carbsG: 1, fatG: 1 } }), libItem('fine')]);
+
+    const result = await syncNow();
+
+    expect(w.markWeightsSyncError).toHaveBeenCalledWith([{ id: weight(0).id, updatedAt: weight(0).updatedAt }], expect.stringMatching(/18\.5 lb is outside 50–700 lb/));
+    expect(m.markMealsSyncError).toHaveBeenCalledWith([{ id: 'typo', updatedAt: 7 }], expect.stringMatching(/Stir fry: 12,400 kcal is outside 0–10,000/));
+    const sent = (action: ActionName) => call.mock.calls.find((c) => c[0] === action)![1];
+    expect(sent('upsertWeights').entries.map((r: { entryId: string }) => r.entryId)).toEqual([weight(1).id]);
+    expect(sent('upsertMeals').entries.map((r: { entryId: string }) => r.entryId)).toEqual(['ok']);
+    expect(sent('upsertLibrary').items.map((r: { entryId: string }) => r.entryId)).toEqual(['fine']);
+    expect(result).toMatchObject({ weightsSynced: 1, mealsSynced: 1, libraryPushed: 1 });
+    expect(result.errors).toHaveLength(3);
   });
 
   it('is single-flight', async () => {
@@ -351,8 +394,8 @@ describe('summary', () => {
     mockGetSheetInfo.mockResolvedValue(info);
     const got = await refreshSummary();
     expect(call).toHaveBeenCalledWith('getSummary', { person: 'Her', from: '2026-09-14', to: toLocalDate(NOW) });
-    expect(got).toEqual({ ...summary, fetchedAt: NOW });
-    expect(mockKvSet).toHaveBeenCalledWith('summary', { ...summary, fetchedAt: NOW });
+    expect(got).toEqual({ ...summary, fetchedAt: NOW, url: 'https://x/exec' });
+    expect(mockKvSet).toHaveBeenCalledWith('summary', { ...summary, fetchedAt: NOW, url: 'https://x/exec' });
     expect(mockRefreshSheetInfo).not.toHaveBeenCalled();
   });
 
@@ -381,12 +424,24 @@ describe('summary', () => {
   });
 
   it('getCachedSummary returns the cache only for the current person', async () => {
-    mockKvGet.mockResolvedValue({ ...summary, fetchedAt: 5 } as never);
-    expect(await getCachedSummary()).toEqual({ ...summary, fetchedAt: 5 });
+    mockKvGet.mockResolvedValue({ ...summary, fetchedAt: 5, url: 'https://x/exec' } as never);
+    expect(await getCachedSummary()).toEqual({ ...summary, fetchedAt: 5, url: 'https://x/exec' });
     expect(mockKvGet).toHaveBeenCalledWith('summary');
-    mockGetSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, person: 'Him' });
+    mockGetSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, person: 'Him', sheetWebAppUrl: 'https://x/exec' });
     expect(await getCachedSummary()).toBeNull();
     mockKvGet.mockResolvedValue(null as never);
+    expect(await getCachedSummary()).toBeNull();
+  });
+
+  it('getCachedSummary ignores a cache fetched from another sheet URL (or saved before URLs were kept)', async () => {
+    mockKvGet.mockResolvedValue({ ...summary, fetchedAt: 5, url: 'https://old/exec' } as never);
+    expect(await getCachedSummary()).toBeNull();
+    mockKvGet.mockResolvedValue({ ...summary, fetchedAt: 5 } as never);
+    expect(await getCachedSummary()).toBeNull();
+    mockKvGet.mockResolvedValue({ ...summary, fetchedAt: 5, url: 'https://x/exec' } as never);
+    mockGetSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, person: 'Her', sheetWebAppUrl: ' https://x/exec ' });
+    expect(await getCachedSummary()).toEqual({ ...summary, fetchedAt: 5, url: 'https://x/exec' });
+    mockGetSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, person: 'Her', sheetWebAppUrl: null });
     expect(await getCachedSummary()).toBeNull();
   });
 });

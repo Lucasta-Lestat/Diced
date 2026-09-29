@@ -37,6 +37,11 @@ export interface PhotoAsset {
   origin: 'library' | 'capture';
   /** Category chosen at capture time (quick log), so classification can be skipped. */
   presetCategory?: PhotoCategory | null;
+  /**
+   * The photo sits in an album a messaging app saves received images to (e.g. `WhatsApp`),
+   * so it is excluded like a messaging-app file name. Best-effort; absent when unknown.
+   */
+  fromMessagingAlbum?: boolean;
 }
 
 /** Per-photo processing state persisted in SQLite (table `photos`). */
@@ -103,6 +108,11 @@ export interface WeightEntry {
   status: EntryStatus;
   syncError: string | null;
   updatedAt: number;
+  /**
+   * The user picked `chosenAssetId` by hand (review). A later run that adds readings for the
+   * day keeps that choice instead of re-picking automatically. Absent = automatic choice.
+   */
+  chosenByUser?: boolean;
 }
 
 export type MealSlot = 'breakfast' | 'lunch' | 'dinner' | 'snack';
@@ -168,6 +178,12 @@ export interface MealEstimate {
   /** How many independent estimates were averaged (thorough mode = 2). */
   samples: number;
   createdAt: number;
+  /**
+   * The photos show only what was left after eating (a partly eaten or empty plate) and no
+   * photo of the food before it. The pipeline then adds them to the earlier photos of the same
+   * meal when it can. Absent = false.
+   */
+  leftoversOnly?: boolean;
 }
 
 export interface MealEntry {
@@ -190,6 +206,12 @@ export interface MealEntry {
   /** Pipeline error (estimation failed) or sync error. */
   error: string | null;
   updatedAt: number;
+  /**
+   * The meal's row may be in the Food Log: it was synced at least once, or it was approved /
+   * sync_error before a re-estimate or merge moved it back to needs_review. Rejecting it must
+   * then delete the row. Absent = never reached the sheet.
+   */
+  inSheet?: boolean;
 }
 
 /** A "usual meal" with confirmed numbers, shared between phones via the sheet. */
@@ -200,10 +222,17 @@ export interface LibraryItem {
   macros: Macros;
   aliases: string[];
   addedBy: PersonLabel;
+  /** Uses as last read from (or written to) the sheet. */
   uses: number;
+  /** When the name / serving / numbers last changed (a use doesn't change it). */
   updatedAt: number;
-  /** false until pushed to the sheet. */
+  /** false until the item's content is pushed to the sheet. */
   synced: boolean;
+  /**
+   * Uses counted on this phone that the sheet doesn't have yet. They are added to the sheet's
+   * count on the next sync instead of overwriting it, so the two phones' counts add up.
+   */
+  pendingUses?: number;
 }
 
 // ---------------------------------------------------------------------------

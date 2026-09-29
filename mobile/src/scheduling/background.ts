@@ -26,8 +26,14 @@ export function isSheetConfigured(settings: AppSettings): boolean {
   return Boolean(settings.person && settings.sheetWebAppUrl);
 }
 
-/** Which automatic run is due now (weekly wins), or null. Manual mode never scans on its own. */
+/**
+ * Which automatic run is due now (weekly wins), or null. Nothing runs on its own until onboarding
+ * is finished: the privacy step (where the user chooses automatic scanning or Manual) comes after
+ * the sheet, person, Claude key and photo-access steps, and the background task can fire in between.
+ * Manual mode never scans on its own.
+ */
 export function dueAutoRun(settings: AppSettings, now: number): 'weekly' | 'daily' | null {
+  if (!settings.onboardingComplete) return null;
   if (!isSheetConfigured(settings) || settings.classificationMode !== 'cloud_thumbnails') return null;
   if (isWeeklyRunDue(settings, now)) return 'weekly';
   if (isDailyRunDue(settings, now)) return 'daily';
@@ -104,7 +110,8 @@ async function syncApproved(): Promise<boolean> {
 export async function runBackgroundTask(): Promise<BackgroundTask.BackgroundTaskResult> {
   try {
     const settings = await getSettings();
-    if (!isSheetConfigured(settings)) return BackgroundTask.BackgroundTaskResult.Success;
+    // Before onboarding is finished the user hasn't agreed to automatic processing yet.
+    if (!settings.onboardingComplete || !isSheetConfigured(settings)) return BackgroundTask.BackgroundTaskResult.Success;
     const reason = dueAutoRun(settings, Date.now());
     const processed = reason ? await processDueRun(reason) : true;
     const synced = await syncApproved();

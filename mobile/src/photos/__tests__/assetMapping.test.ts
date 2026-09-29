@@ -89,6 +89,16 @@ describe('downscaleTarget', () => {
   it('does nothing for unknown sizes', () => {
     expect(downscaleTarget(0, 0, 384)).toBeNull();
   });
+
+  it('also caps the total pixel count when asked (model limit ~3.75 MP)', () => {
+    // 12 MP 4:3 → 2236 × 1677 ≈ 3.75 MP, below the 2576 px edge limit.
+    expect(downscaleTarget(4032, 3024, 2576, 3_750_000)).toEqual({ width: 2236 });
+    expect(2236 * Math.floor(2236 / (4032 / 3024))).toBeLessThanOrEqual(3_750_000);
+    // A long panorama is bounded by the edge.
+    expect(downscaleTarget(12000, 3000, 2576, 3_750_000)).toEqual({ width: 2576 });
+    // Already within both limits.
+    expect(downscaleTarget(2000, 1500, 2576, 3_750_000)).toBeNull();
+  });
 });
 
 describe('stripDataUriPrefix', () => {

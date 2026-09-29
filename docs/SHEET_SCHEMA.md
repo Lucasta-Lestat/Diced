@@ -87,7 +87,7 @@ Entry ID blank.`
 | J | Confidence | `high` / `medium` / `low` |
 | K | Method | `photo` / `label` / `barcode` / `library` / `restaurant` / `manual` |
 | L | Items | text: `chicken breast 150 g (248 kcal) · white rice 180 g (234 kcal) · …` |
-| M | Notes | text (user notes + key assumptions) |
+| M | Notes | text: user notes · answered questions (`Question: answer`) · `Assumed: …` (up to 3 key assumptions; an item flagged for a portion check reads `check portion of <item>`) |
 | N | Entry ID | text, unique (uuid from the app) |
 | O | Logged at | datetime |
 
@@ -182,10 +182,19 @@ number formats as in Conventions.
   average. Measure waist / shoulders / chest every other week. Yellow = you fill in;
   everything marked auto fills itself.`
 * **Migration (once):** every week row whose `E` or `K` held a typed number (not a
-  formula) before setup is copied into `Weight Log` as
+  formula) from 50 to 700 before setup is copied into `Weight Log` as
   `Date = that week's Monday ('Weekly Check-in'!B)`, `Source = migrated`,
-  `Entry ID = w:<person>:<YYYY-MM-DD>`, *before* the formulas replace it. (Today
-  `E5 = 185` for Her.) Skip if a Weight Log row with that Entry ID already exists.
+  `Confidence = high`, `Entry ID = w:<person>:<YYYY-MM-DD>`, *before* the formulas
+  replace it. (Today `E5 = 185` for Her.) Skip if a Weight Log row with that Entry ID
+  already exists.
+* Every typed `E`/`K` value that is not copied (not a number, outside 50–700, no known
+  Monday, or its Entry ID already exists in Weight Log with a different weight) is kept
+  as a **cell note** on that Weekly Check-in cell, appended to any note already there:
+  `Diced setup (<date>) replaced the typed value "…" with the weekly average. It was not
+  copied into Weight Log because <reason>.` A typed value equal to the weight already
+  logged for that Monday gets no note, because nothing is lost. The setup toast counts
+  the noted cells, and `setupDiced()` returns `{ migrated, notMoved }`. A second run
+  finds only formulas, so it copies nothing and writes no new notes.
 
 ### Dashboard
 * Every formula containing `LOOKUP(2,1/(` that is not already wrapped gets wrapped:
@@ -269,11 +278,14 @@ interface SheetSummary {
 
 Semantics:
 * Upserts match on Entry ID; a row with the same Entry ID is overwritten in place,
-  otherwise appended after the last used row. `Logged at` is set on every write.
+  otherwise appended after the last used row (`getLastRow()`: the last row with any
+  content in any column, so hand-typed rows without a Date / Entry ID and notes below
+  the data are never overwritten). `Logged at` is set on every write.
 * Dates are interpreted in the **spreadsheet's** time zone
   (`Utilities.parseDate(date, ss.getSpreadsheetTimeZone(), 'yyyy-MM-dd')`).
 * Validation: unknown `person` → `bad_request`; `weightLb` must be 50–700;
-  `kcal` 0–10000; dates must parse. Reject the whole request on the first invalid row
+  `kcal` 0–10000; `proteinG` / `carbsG` / `fatG` 0–2000; library `uses` a whole number
+  0–1000000; dates must parse. Reject the whole request on the first invalid row
   (report its index) so a sync is all-or-nothing.
 * `getSummary` reads **computed values** from `Daily Log` (`days`, filtered to
   `from..to`) and from `Weekly Check-in` (`D`/`J` target weight, `E`/`K` average) plus
@@ -282,10 +294,32 @@ Semantics:
   Entry ID are given one (a UUID written back to the sheet) so the phones can update them.
 * `upsertLibrary`: `addedBy` must be a person label **or `''`** (hand-typed rows may leave
   Added by blank, and a phone sends that blank back when it bumps `uses`).
+* `uses` is stored as sent. A phone calls `listLibrary` first and then sends
+  `uses = the sheet's count + the uses logged on that phone since its last push`, so
+  both phones' counts add up. The phone skips the push when the pull failed. If an
+  `upsertLibrary` response is lost after the write, those uses can be counted twice;
+  that is acceptable for a ranking hint.
+* The phones check the same bounds before sending (weights 50–700 lb; meal and library
+  `kcal` 0–10000 and protein/carbs/fat 0–2000 g). An out-of-range weigh-in or meal is
+  marked as a sync error on its own, and an out-of-range library item is skipped, so
+  neither fails the batch.
 
 ## Custom menu
 
 `onOpen` adds a **Diced** menu: `Set up / repair Diced tabs` (runs `setupDiced`),
 `Show app connection info` (dialog with the web-app URL from
-`ScriptApp.getService().getUrl()`, the token, and a `diced://connect?url=…&token=…`
-link to open on each phone), `Rotate app token`.
+`ScriptApp.getService().getUrl()`, or the `/exec` URL pasted earlier and saved in
+`DICED_WEBAPP_URL`, plus the token, a `diced://connect?url=…&token=…` link and a QR code
+of it to open on each phone), `Rotate app token`.
+
+* **Web-app URL rule.** The dialog, `saveWebAppUrl` and the stored `DICED_WEBAPP_URL` only
+  accept `DICED_EXEC_URL_RE`:
+  `^https://script\.google\.com/(macros|a/macros/<domain>|a/<domain>/macros)/s/<id>/exec$`.
+  The dialog's client-side check is built from the same regex. A stored value that
+  doesn't match is ignored. The phone enforces the identical pattern before it sends
+  anything (`mobile/src/sync/webAppUrl.ts`), so a crafted connect link can't point a
+  phone's token at another host. Change both together.
+* **QR code.** The encoder (qrcodejs 1.0.0) is loaded from cdnjs with Subresource
+  Integrity (`integrity="sha512-…"`, `crossorigin="anonymous"`, `DICED_QR_SCRIPT` in
+  `Code.gs`). If the browser blocks it, the dialog shows "QR code unavailable" and the
+  link still works.

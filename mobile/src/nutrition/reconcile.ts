@@ -4,7 +4,9 @@
  * - other items with grams + usdaQuery: USDA per-100g × grams; if model and USDA kcal differ
  *   by > 35 % keep the USDA number but add a `check_portion:<item>` assumption and drop
  *   confidence one level
- * - restaurant (brand set, webLookup on): published nutrition replaces the total
+ * - restaurant (brand set, webLookup on): published nutrition replaces the one item it is for
+ *   (the whole meal only when the meal is that one item); sides, drinks, leftovers and anything
+ *   the user said stay as the model estimated them
  * Always recomputes totals and the kcal range.
  */
 import { lookupPublishedNutrition, type PublishedNutrition } from '../ai/restaurant';
@@ -19,6 +21,14 @@ import { searchUsda, type UsdaFood } from './usda';
 export interface ReconcileOptions {
   useUsda: boolean;
   webLookupForRestaurants: boolean;
+  /**
+   * The request carried user notes or answers. They are authoritative for the model ("ate half",
+   * "shared with partner"), and a published whole-item figure would override them, so the
+   * published lookup is skipped.
+   */
+  userContext?: boolean;
+  /** The run's abort signal: no lookup starts once it fires, and the web lookup is cancelled. */
+  signal?: AbortSignal;
 }
 
 /** Relative kcal disagreement (vs. the model's number) above which a portion is questioned. */
@@ -30,6 +40,18 @@ export { CHECK_PORTION_PREFIX };
 /** Range used when the model's own range can't be rescaled (e.g. it estimated 0 kcal). */
 const DEFAULT_RANGE_SPREAD = 0.25;
 const USDA_CONCURRENCY = 3;
+/**
+ * Share of the words two item names must have in common (both ways) to be the same menu item.
+ * Strict on purpose: "Big Mac Meal" (a combo with fries and a drink) must not replace the
+ * "Big Mac" item when the fries and drink are listed too. A miss only keeps the photo estimate.
+ */
+const PUBLISHED_MATCH = 0.75;
+/**
+ * Assumptions that say the photos show a partly eaten meal: the published whole-item figure would
+ * undo the leftover subtraction, so the model's numbers are kept.
+ */
+const PARTIAL_EATING =
+  /\b(left ?overs?|left on the plate|left behind|uneaten|not eaten|half[- ]eaten|part(ly|ially)[- ]eaten|didn'?t finish|not finished|unfinished|(ate|eaten) (only )?(half|part|some)|shared|split with|subtract)/i;
 
 const log = logger('reconcile');
 
@@ -104,6 +126,7 @@ function isUsableMacros(m: Macros | null | undefined): m is Macros {
   return !!m && [m.kcal, m.proteinG, m.carbsG, m.fatG].every((v) => Number.isFinite(v) && v >= 0);
 }
 
+/** Lookups are optional: a failure (including a cancelled run) keeps the model's numbers. */
 async function quietly<T>(what: string, task: () => Promise<T | null>): Promise<T | null> {
   try {
     return await task();
@@ -111,6 +134,10 @@ async function quietly<T>(what: string, task: () => Promise<T | null>): Promise<
     log.warn(`${what} failed: ${errorMessage(e)}`);
     return null;
   }
+}
+
+function aborted(opts: ReconcileOptions): boolean {
+  return opts.signal?.aborted === true;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,24 +185,65 @@ function applyBarcode(item: FoodItem, product: OffProduct): FoodItem | null {
 // Restaurant / brand (published nutrition via web search)
 // ---------------------------------------------------------------------------
 
-function publishedItem(published: PublishedNutrition, estimate: MealEstimate, modelItems: FoodItem[]): FoodItem {
+/** The item the lookup is for: the meal's only item (whole dish), else the meal title. */
+function publishedDish(estimate: MealEstimate, items: FoodItem[]): string {
+  if (items.length === 1 && items[0].source === 'model' && items[0].name.trim()) return items[0].name;
+  return estimate.title;
+}
+
+/**
+ * Which model item the published numbers are for: the meal's only item, or the one model item
+ * whose name and the published name mostly share their words (both ways, ignoring the brand).
+ * -1 when none or several fit — e.g. a burrito bowl itemised into rice, chicken and beans matches
+ * no single item, and replacing "chicken" with the whole bowl would count the rice twice.
+ */
+function publishedTarget(items: FoodItem[], published: PublishedNutrition, brand: string): number {
+  if (items.length === 1) return items[0].source === 'model' ? 0 : -1;
+  const brandWords = new Set(words(brand));
+  const publishedWords = words(published.itemName).filter((w) => !brandWords.has(w));
+  if (publishedWords.length === 0) return -1;
+  const scored = items.flatMap((item, index) => {
+    if (item.source !== 'model') return [];
+    const itemWords = words(item.name).filter((w) => !brandWords.has(w));
+    const covered = matchWords(publishedWords, item.name);
+    const back = matchWords(itemWords, published.itemName);
+    if (!covered.coreMatched || !back.coreMatched) return [];
+    const score = Math.min(covered.recall, back.recall);
+    return score >= PUBLISHED_MATCH ? [{ index, score }] : [];
+  });
+  if (scored.length === 0) return -1;
+  scored.sort((a, b) => b.score - a.score);
+  return scored.length > 1 && scored[1].score === scored[0].score ? -1 : scored[0].index;
+}
+
+/**
+ * The published numbers for the item as served. The model's grams (its estimate of the served
+ * weight) are kept so that correcting the grams in review scales the published numbers.
+ */
+function publishedItem(published: PublishedNutrition, item: FoodItem): FoodItem {
   return {
-    name: published.itemName.trim() || estimate.title,
-    portion: published.servingNote.trim() || '1 serving',
-    grams: null,
+    name: published.itemName.trim() || item.name,
+    portion: published.servingNote.trim() || item.portion || '1 serving',
+    grams: item.grams,
     macros: roundMacros(published.macros),
     source: 'web',
     confidence: 'high',
     usdaQuery: null,
     fdcId: null,
-    modelMacros: sumMacros(modelItems),
+    modelMacros: item.modelMacros ?? item.macros,
   };
 }
 
-function publishedNote(published: PublishedNutrition, modelKcal: number): string {
+function publishedNote(published: PublishedNutrition, modelKcal: number, used: boolean): string {
   const serving = published.servingNote.trim() ? ` (${published.servingNote.trim()})` : '';
   const source = published.source.trim() ? ` from ${published.source.trim()}` : '';
-  return `Published nutrition for ${published.itemName.trim() || 'this dish'}${serving}${source}; photo estimate was ${Math.round(modelKcal)} kcal`;
+  const figure = used ? '' : `: ${Math.round(published.macros.kcal)} kcal (for reference; the photo estimate is kept)`;
+  const estimateNote = used ? `; photo estimate was ${Math.round(modelKcal)} kcal` : '';
+  return `Published nutrition for ${published.itemName.trim() || 'this dish'}${serving}${source}${figure}${estimateNote}`;
+}
+
+function mentionsPartialEating(assumptions: string[]): boolean {
+  return assumptions.some((a) => PARTIAL_EATING.test(a));
 }
 
 // ---------------------------------------------------------------------------
@@ -204,11 +272,11 @@ function applyUsda(item: FoodItem, food: UsdaFood): { item: FoodItem; disagrees:
   };
 }
 
-async function reconcileWithUsda(items: FoodItem[]): Promise<{ items: FoodItem[]; flagged: string[] }> {
+async function reconcileWithUsda(items: FoodItem[], signal?: AbortSignal): Promise<{ items: FoodItem[]; flagged: string[] }> {
   const out = [...items];
   const flagged = new Set<number>();
   await mapLimit(items, USDA_CONCURRENCY, async (item, index) => {
-    if (!usdaEligible(item)) return;
+    if (!usdaEligible(item) || signal?.aborted) return;
     const food = await quietly('USDA lookup', () => searchUsda(item.usdaQuery ?? ''));
     if (!food || !isUsableMacros(food.per100g)) return;
     const result = applyUsda(item, food);
@@ -229,7 +297,7 @@ async function reconcile(estimate: MealEstimate, opts: ReconcileOptions): Promis
   const assumptions = [...estimate.assumptions];
 
   const barcode = estimate.barcode;
-  if (barcode && isValidGtin(barcode) && method !== 'label' && method !== 'library') {
+  if (barcode && isValidGtin(barcode) && method !== 'label' && method !== 'library' && !aborted(opts)) {
     const product = await quietly('barcode lookup', () => lookupBarcode(barcode));
     const target = product ? barcodeTarget(items, product) : -1;
     const applied = product && target >= 0 ? applyBarcode(items[target], product) : null;
@@ -240,21 +308,30 @@ async function reconcile(estimate: MealEstimate, opts: ReconcileOptions): Promis
     }
   }
 
-  let published = false;
   const brand = estimate.brand?.trim();
-  if (method === 'photo' && brand && opts.webLookupForRestaurants) {
-    const found = await quietly('published nutrition lookup', () => lookupPublishedNutrition(brand, estimate.title));
+  // Notes / answers and leftovers make the model's numbers describe what was actually eaten;
+  // a published whole-item figure would override that, so it isn't looked up at all.
+  const partial = opts.userContext === true || mentionsPartialEating(estimate.assumptions);
+  if (method === 'photo' && brand && opts.webLookupForRestaurants && !partial && !aborted(opts)) {
+    const found = await quietly('published nutrition lookup', () =>
+      lookupPublishedNutrition(brand, publishedDish(estimate, items), { signal: opts.signal }),
+    );
     if (found && isUsableMacros(found.macros) && found.macros.kcal > 0) {
-      lead.push(publishedNote(found, sumMacros(items).kcal));
-      items = [publishedItem(found, estimate, items)];
-      method = 'restaurant';
-      confidence = atLeast(confidence, 'medium');
-      published = true;
+      const target = publishedTarget(items, found, brand);
+      if (target >= 0) {
+        lead.push(publishedNote(found, items[target].macros.kcal, true));
+        items[target] = publishedItem(found, items[target]);
+        method = 'restaurant';
+        // The published figure is the whole meal only when the meal is that one item.
+        if (items.length === 1) confidence = atLeast(confidence, 'medium');
+      } else {
+        lead.push(publishedNote(found, sumMacros(items).kcal, false));
+      }
     }
   }
 
-  if (opts.useUsda && !published) {
-    const usda = await reconcileWithUsda(items);
+  if (opts.useUsda && !aborted(opts)) {
+    const usda = await reconcileWithUsda(items, opts.signal);
     items = usda.items;
     if (usda.flagged.length > 0) {
       confidence = lowerConfidence(confidence);

@@ -1,6 +1,6 @@
 /** Pure view-model helpers for Home and Review (no native imports). */
-import { addDays, mondayOf } from '../lib/dates';
-import { isConfidentMeal, isConfidentWeight } from '../pipeline/confidence';
+import { addDays, mondayOf, toLocalDate } from '../lib/dates';
+import { CHECK_PORTION_PREFIX, isConfidentMeal, isConfidentWeight } from '../pipeline/confidence';
 import type { ClarifyingQuestion, EntryStatus, LocalDate, MealEntry, WeightEntry } from '../types';
 
 export interface ReviewDay {
@@ -96,4 +96,32 @@ function timeToMinutes(t: string): number {
 export function scaledKcal(kcal: number, oldGrams: number | null, newGrams: number): number | null {
   if (oldGrams === null || !(oldGrams > 0) || !Number.isFinite(newGrams)) return null;
   return Math.round((kcal * newGrams) / oldGrams);
+}
+
+/**
+ * An estimate's assumptions split into readable notes and the items whose portion needs a check
+ * (`check_portion:<item>`, added when USDA and Claude disagree a lot — approve-all skips those).
+ */
+export function splitAssumptions(assumptions: readonly string[]): { notes: string[]; checkPortions: string[] } {
+  const notes: string[] = [];
+  const checkPortions: string[] = [];
+  for (const a of assumptions) {
+    if (a.startsWith(CHECK_PORTION_PREFIX)) {
+      const name = a.slice(CHECK_PORTION_PREFIX.length).trim();
+      if (name && !checkPortions.includes(name)) checkPortions.push(name);
+    } else {
+      notes.push(a);
+    }
+  }
+  return { notes, checkPortions };
+}
+
+/**
+ * Whether Home should fetch the sheet summary again: nothing cached, older than `staleMs`, fetched
+ * in an earlier plan week (targets and averages are per Monday–Sunday week), or the clock went back.
+ */
+export function summaryNeedsRefresh(fetchedAt: number | null, now: number, staleMs: number): boolean {
+  if (fetchedAt === null || !Number.isFinite(fetchedAt) || now < fetchedAt) return true;
+  if (now - fetchedAt > staleMs) return true;
+  return mondayOf(toLocalDate(fetchedAt)) !== mondayOf(toLocalDate(now));
 }

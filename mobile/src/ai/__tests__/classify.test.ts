@@ -48,6 +48,7 @@ describe('classifyBatch', () => {
       'asset-2': { category: 'other', confidence: 0 },
     });
     const req = fake.requests[0];
+    expect(req.headers['x-stainless-timeout']).toBe('120');
     expect(req.body).toMatchObject({
       fallbacks: 'default',
       output_config: { effort: 'low' },

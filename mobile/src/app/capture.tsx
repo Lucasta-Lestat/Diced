@@ -25,7 +25,7 @@ import {
 import { requestSync } from '../ui/autoRun';
 import { dayLabel, formatInt, MEAL_SLOTS, plural, runSummary, slotText } from '../ui/format';
 import { parseDecimal, parseMacroInputs, parseTimeInput, parseWeightInput, recentDates, slotForHour, type MacroInputs } from '../ui/forms';
-import { useAction, useAsync, useNow } from '../ui/hooks';
+import { useAction, useAsync, useNow, useStillHere } from '../ui/hooks';
 import { pickPhotos, takePhoto } from '../ui/photoPicker';
 import { spacing } from '../ui/theme';
 
@@ -33,7 +33,9 @@ type Kind = 'scale' | 'meal';
 
 async function loadCaptureData(): Promise<{ settings: AppSettings; library: LibraryItem[] }> {
   const [settings, library] = await Promise.all([getSettings(), listLibrary()]);
-  return { settings, library: [...library].sort((a, b) => b.uses - a.uses) };
+  // Uses not yet synced to the sheet (pendingUses) count too, so a meal logged today ranks right away.
+  const usesOf = (item: LibraryItem) => item.uses + (item.pendingUses ?? 0);
+  return { settings, library: [...library].sort((a, b) => usesOf(b) - usesOf(a)) };
 }
 
 export default function Capture() {
@@ -67,22 +69,35 @@ export default function Capture() {
   );
 }
 
+type Created = Awaited<ReturnType<typeof processCapturedPhoto>>;
+
+function detailRoute(created: Created) {
+  const pathname = created.kind === 'weight' ? '/review/weight/[id]' : '/review/meal/[id]';
+  return { pathname, params: { id: created.id } } as const;
+}
+
 function PhotoCard({ kind }: { kind: Kind }) {
   const router = useRouter();
+  const stillHere = useStillHere();
   const [picked, setPicked] = useState<{ result: ProcessResult; guessed: number } | null>(null);
+  const [ready, setReady] = useState<Created | null>(null);
   const category = kind === 'scale' ? 'scale' : 'food';
 
   const camera = useAction(async () => {
     setPicked(null);
+    setReady(null);
     const shot = await takePhoto();
     if (!shot) return;
     const created = await processCapturedPhoto(shot.uri, category, shot.takenAt);
-    const pathname = created.kind === 'weight' ? '/review/weight/[id]' : '/review/meal/[id]';
-    router.replace({ pathname, params: { id: created.id } });
+    // The estimate can take a minute: only open it if the user is still here. Otherwise it waits in
+    // Review (and here, if this screen is still in the stack).
+    if (stillHere()) router.replace(detailRoute(created));
+    else setReady(created);
   });
 
   const library = useAction(async () => {
     setPicked(null);
+    setReady(null);
     const photos = await pickPhotos();
     if (photos.length === 0) return;
     const result = await processPickedPhotos(
@@ -115,8 +130,16 @@ function PhotoCard({ kind }: { kind: Kind }) {
           accessibilityLabel={`Choose photos of ${what} from your library`}
         />
       </ButtonRow>
-      {busy ? <ProgressView label={kind === 'scale' ? 'Reading the scale…' : 'Estimating the meal…'} message="This can take up to a minute." /> : null}
+      {busy ? <ProgressView label={kind === 'scale' ? 'Reading the scale…' : 'Estimating the meal…'} message="This usually takes under a minute, sometimes a few." /> : null}
       <ErrorBanner message={camera.error ?? library.error} />
+      {ready ? (
+        <Notice
+          tone="success"
+          message={ready.kind === 'weight' ? 'Your weigh-in is ready to review.' : 'Your meal is ready to review.'}
+          actionLabel="Open"
+          onAction={() => router.push(detailRoute(ready))}
+        />
+      ) : null}
       {picked ? (
         <View style={styles.result}>
           <Notice tone={picked.result.errors.length ? 'warning' : 'success'} message={runSummary(picked.result)} actionLabel="Review" onAction={() => router.push('/review')} />

@@ -16,6 +16,7 @@ const contentOf = (req: CapturedRequest) => (req.body!.messages as { content: Bl
 
 const food = (kcal: number, over: Record<string, unknown> = {}) => ({
   contains_food: true,
+  leftovers_only: false,
   title: 'Salmon and potatoes',
   method: 'photo',
   items: [
@@ -77,6 +78,8 @@ describe('estimateMeal (standard)', () => {
     expect(fake.requests).toHaveLength(1);
     const req = fake.requests[0];
     expect(req.headers['anthropic-beta'].split(',')).toContain(FALLBACK_BETA);
+    // A long effort-high turn gets the SDK's non-streaming ceiling (10 min), not the 120 s client default.
+    expect(req.headers['x-stainless-timeout']).toBe('600');
     expect(req.body).toMatchObject({
       model: 'claude-opus-5-5',
       max_tokens: 16000,

@@ -12,7 +12,11 @@ import { errorMessage } from '../lib/log';
 export const DEFAULT_MODEL = 'claude-opus-5-5';
 export const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
 
-/** Per attempt; the SDK retries timeouts and 408/409/429/5xx up to MAX_RETRIES times. */
+/**
+ * Client default per attempt (key test, model lookups). Model requests set their own per-request
+ * timeout sized to their effort (request.ts REQUEST_TIMEOUT_BY_EFFORT). The SDK retries timeouts
+ * and 408/409/429/5xx up to MAX_RETRIES times.
+ */
 export const REQUEST_TIMEOUT_MS = 120_000;
 export const MAX_RETRIES = 2;
 
@@ -150,14 +154,17 @@ function classifyApiError(e: InstanceType<typeof Anthropic.APIError>, model: str
  * model's metadata (no tokens billed), which checks the key, the network and the model id at once.
  * Pass `apiKey` to test a key before saving it.
  */
-export async function testAnthropicKey(apiKey?: string): Promise<{ ok: boolean; message: string }> {
+export async function testAnthropicKey(apiKey?: string): Promise<{ ok: boolean; message: string; kind?: AiApiErrorKind }> {
   const model = await resolveModel();
   try {
     const client = apiKey?.trim() ? buildClient(apiKey.trim()) : await getAnthropic();
     const info = await client.models.retrieve(model);
     return { ok: true, message: `Connected — ${info.display_name || model} is available.` };
   } catch (e) {
-    return { ok: false, message: keyTestMessage(e, model) };
+    const mapped = e instanceof AiNotConfiguredError ? null : toAiError(e, model);
+    const message = keyTestMessage(e, model);
+    // `kind` lets the UI tell a rejected key ('auth') from offline / rate-limited / model problems.
+    return mapped instanceof AiApiError ? { ok: false, message, kind: mapped.kind } : { ok: false, message };
   }
 }
 

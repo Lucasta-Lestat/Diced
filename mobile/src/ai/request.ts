@@ -26,6 +26,20 @@ export type Effort = 'low' | 'medium' | 'high';
 /** Non-streaming ceiling; adaptive thinking counts toward it, so leave room beyond the JSON. */
 export const MAX_TOKENS = 16_000;
 
+/**
+ * Per-attempt HTTP timeout by effort. A non-streaming response arrives only once generation is
+ * done, and thinking (always on for Opus 5.5) counts toward MAX_TOKENS, so a high-effort meal
+ * estimate that uses a good part of that budget legitimately runs past two minutes. Cutting it
+ * off would make the SDK retry it from scratch (re-billing the abandoned attempt) and finally
+ * fail. `high` therefore gets the SDK's own non-streaming ceiling for this max_tokens (10 min);
+ * the cheap calls keep short limits so a stalled connection is noticed quickly.
+ */
+export const REQUEST_TIMEOUT_BY_EFFORT: Readonly<Record<Effort, number>> = {
+  low: 120_000,
+  medium: 300_000,
+  high: 600_000,
+};
+
 /** Optional per-call options (additive to the declared signatures). */
 export interface AiCallOptions {
   /** Cancels the HTTP request (e.g. the run's abort signal). */
@@ -120,7 +134,7 @@ export async function structuredCall<S extends z.ZodType>(
         messages: [{ role: 'user', content: req.content }],
         output_config: { effort: req.effort, format },
       },
-      { signal: opts.signal },
+      { signal: opts.signal, timeout: REQUEST_TIMEOUT_BY_EFFORT[req.effort] },
     );
   } catch (e) {
     throw toAiError(e, model);

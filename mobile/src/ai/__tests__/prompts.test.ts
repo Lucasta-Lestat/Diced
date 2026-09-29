@@ -28,7 +28,11 @@ describe('system prompts', () => {
     expect(FOOD_SYSTEM).toMatch(/at most 3/);
     expect(FOOD_SYSTEM).toMatch(/more than 10%/);
     expect(FOOD_SYSTEM).toMatch(/leftovers/);
+    // A lone "after" photo is flagged, not logged as eaten.
+    expect(FOOD_SYSTEM).toMatch(/leftovers_only to true/);
+    expect(FOOD_SYSTEM).toMatch(/Don't log the visible leftovers as eaten/);
     expect(RESTAURANT_SYSTEM).toMatch(/report_nutrition exactly once/);
+    expect(RESTAURANT_SYSTEM).toMatch(/not a combo or meal deal/);
   });
 });
 

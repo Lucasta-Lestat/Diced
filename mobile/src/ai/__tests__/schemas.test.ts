@@ -156,6 +156,7 @@ const item = (over: Partial<FoodRaw['items'][number]> = {}): FoodRaw['items'][nu
 
 const foodRaw = (over: Partial<FoodRaw> = {}): FoodRaw => ({
   contains_food: true,
+  leftovers_only: false,
   title: 'Chicken and rice',
   method: 'photo',
   items: [item(), item({ name: 'white rice', grams: 180, kcal: 234, protein_g: 4.9, carbs_g: 50.8, fat_g: 0.5, usda_query: 'rice, white, long-grain, cooked' })],
@@ -184,6 +185,13 @@ describe('toMealEstimate', () => {
     expect(est.items[0].modelMacros).toEqual(est.items[0].macros);
     expect(est.assumptions).toEqual(['Cooked without oil']);
     expect(est).toMatchObject({ samples: 1, model: 'claude-opus-5-5', createdAt: 1_000, method: 'photo', libraryItemId: null });
+    expect(est).not.toHaveProperty('leftoversOnly');
+  });
+
+  it('flags photos that show only leftovers (an "after" photo without its "before")', () => {
+    expect(toMealEstimate(foodRaw({ leftovers_only: true }), ctx).leftoversOnly).toBe(true);
+    // An empty plate is still an "after" photo.
+    expect(toMealEstimate(foodRaw({ contains_food: false, leftovers_only: true }), ctx).leftoversOnly).toBe(true);
   });
 
   it('keeps only questions worth > 10 % of the total, max 3, with 2-4 options and ids q1..qN', () => {

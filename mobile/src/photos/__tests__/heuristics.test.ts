@@ -39,6 +39,12 @@ describe('exclusionReason', () => {
     expect(exclusionReason(photo({ filename: 'IMG_0001.PNG', mediaSubtypes: ['screenshot'] }))).toBe('screenshot');
   });
 
+  it('flags images in a messaging app album even with a camera-style name (iOS WhatsApp saves)', () => {
+    expect(exclusionReason(photo({ filename: 'IMG_1234.JPG', fromMessagingAlbum: true }))).toBe('messaging_app');
+    // A photo the user picked or took in the app is always kept.
+    expect(exclusionReason(photo({ fromMessagingAlbum: true, presetCategory: 'food' }))).toBeNull();
+  });
+
   it('ignores unrelated iOS subtypes', () => {
     expect(exclusionReason(photo({ mediaSubtypes: ['livePhoto', 'hdr', 'depthEffect'] }))).toBeNull();
   });

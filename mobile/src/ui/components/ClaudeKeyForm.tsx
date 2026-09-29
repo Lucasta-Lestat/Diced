@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 import { resetAnthropicClient, testAnthropicKey } from '../../ai/client';
 import { getSecret, setSecret } from '../../config/settings';
+import { keyTestAllowsSave, type KeyTestResultLike } from '../forms';
 import { useAction, useAsync } from '../hooks';
 import { spacing } from '../theme';
 import { Button } from './Button';
@@ -16,7 +17,7 @@ export interface ClaudeKeyFormProps {
 /** Enter / test / remove the Claude API key. The saved key is never shown again. */
 export function ClaudeKeyForm({ onSaved }: ClaudeKeyFormProps) {
   const [key, setKey] = useState('');
-  const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [result, setResult] = useState<KeyTestResultLike | null>(null);
   const saved = useAsync(async () => (await getSecret('anthropicApiKey')) !== null);
 
   const test = useAction(async () => {
@@ -26,11 +27,14 @@ export function ClaudeKeyForm({ onSaved }: ClaudeKeyFormProps) {
     return r;
   });
 
-  const save = useAction(async () => {
-    const r = await testAnthropicKey(key.trim());
-    setResult(r);
-    if (!r.ok) return;
-    await setSecret('anthropicApiKey', key);
+  /** `anyway`: store without a passing test (the test failed for a reason other than a bad key). */
+  const save = useAction(async (anyway: boolean) => {
+    if (!anyway) {
+      const r = await testAnthropicKey(key.trim());
+      setResult(r);
+      if (!r.ok) return;
+    }
+    await setSecret('anthropicApiKey', key.trim());
     resetAnthropicClient();
     setKey('');
     await saved.reload();
@@ -65,7 +69,7 @@ export function ClaudeKeyForm({ onSaved }: ClaudeKeyFormProps) {
         helper="Stored in the phone's secure storage and only sent to api.anthropic.com."
       />
       <ButtonRow>
-        <Button compact label="Test & save" onPress={() => void save.run()} loading={save.pending} disabled={!typed} />
+        <Button compact label="Test & save" onPress={() => void save.run(false)} loading={save.pending} disabled={!typed} />
         <Button
           compact
           variant="secondary"
@@ -77,6 +81,15 @@ export function ClaudeKeyForm({ onSaved }: ClaudeKeyFormProps) {
         />
       </ButtonRow>
       {result ? <Notice tone={result.ok ? 'success' : 'warning'} message={result.message} /> : null}
+      {result && !result.ok && typed && keyTestAllowsSave(result) ? (
+        <Button
+          variant="secondary"
+          label="Save anyway"
+          onPress={() => void save.run(true)}
+          loading={save.pending}
+          accessibilityHint="Saves the key even though the test didn't pass; you can test it again later in Settings"
+        />
+      ) : null}
       <ErrorBanner message={save.error ?? test.error ?? remove.error ?? saved.error} />
       {hasKey ? <Button variant="ghost" label="Remove saved key" onPress={() => void remove.run()} loading={remove.pending} /> : null}
     </View>

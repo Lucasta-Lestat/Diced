@@ -176,6 +176,18 @@ describe('mealEntryToRow', () => {
     expect(long.notes.endsWith('…')).toBe(true);
   });
 
+  it('writes check_portion flags as readable text, never the raw token', () => {
+    const row = mealEntryToRow(
+      meal({
+        notes: '',
+        answers: {},
+        estimate: estimate({ assumptions: ['check_portion:white rice', ' check_portion: white rice', 'check_portion:', 'rice is plain'] }),
+      }),
+    );
+    expect(row.notes).toBe('Assumed: check portion of white rice; rice is plain');
+    expect(row.notes).not.toContain('check_portion');
+  });
+
   it('uses the estimate method (e.g. label, library)', () => {
     expect(mealEntryToRow(meal({ estimate: estimate({ method: 'label', confidence: 'high' }) }))).toMatchObject({
       method: 'label',

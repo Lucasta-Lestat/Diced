@@ -1,6 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const vm = require('node:vm');
 const { loadCode, snapshot, formatDate } = require('./helpers/fakeGas');
 const wb = require('./helpers/workbook');
 
@@ -180,7 +181,7 @@ test('typed Weekly Check-in weights migrate into Weight Log once', () => {
   assert.deepEqual([person, lb, time, source, confidence, id], ['Her', 185, '', 'migrated', 'high', 'w:Her:2026-09-28']);
   assert.match(notes, /Weekly Check-in/);
   assert.equal(Object.prototype.toString.call(loggedAt), '[object Date]');
-  assert.deepEqual(gas.callPlain('setupDiced'), { migrated: 0 });
+  assert.deepEqual(gas.callPlain('setupDiced'), { migrated: 0, notMoved: 0 });
   assert.equal(log.getLastRow(), 5);
 });
 
@@ -188,19 +189,62 @@ test('re-running setup migrates a newly typed weight but never duplicates an Ent
   const gas = setUp();
   const wci = sheet(gas, 'Weekly Check-in');
   wci.getRange('K6').setValue(172.4); // typed over the formula: week 2, Him
-  wci.getRange('E5').setValue(999); // out of range → not a weight, formula restored anyway
-  const result = gas.call('setupDiced');
-  assert.equal(result.migrated, 1);
+  wci.getRange('E5').setValue(999); // out of range → not a weight, formula restored, value kept as a note
+  assert.deepEqual(gas.callPlain('setupDiced'), { migrated: 1, notMoved: 1 });
   const log = sheet(gas, 'Weight Log');
   assert.equal(log.getLastRow(), 6);
   assert.deepEqual(log.getRange('B6:C6').getValues()[0], ['Him', 172.4]);
   assert.equal(log.getRange('H6').getValue(), 'w:Him:2026-10-05');
   assert.match(wci.getRange('K6').getFormula(), /^=IFERROR\(ROUND\(AVERAGEIFS\('Daily Log'!\$I/);
+  assert.equal(wci.getRange('K6').getNote(), '', 'migrated → no note');
   assert.match(wci.getRange('E5').getFormula(), /^=IFERROR/);
+  assert.match(wci.getRange('E5').getNote(), /replaced the typed value "999" .*because it is outside 50–700 lb\.$/);
+  assert.match(gas.ss.toasts.at(-1).message, /Moved 1 typed weight.* 1 typed value\(s\) in Weekly Check-in could not be moved/);
 
-  wci.getRange('K6').setValue(171); // same week again: Entry ID exists → skipped
-  assert.equal(gas.call('setupDiced').migrated, 0);
+  wci.getRange('K6').setValue(171); // same week again: Entry ID exists → not moved, kept as a note
+  assert.deepEqual(gas.callPlain('setupDiced'), { migrated: 0, notMoved: 1 });
   assert.equal(log.getLastRow(), 6);
+  assert.match(wci.getRange('K6').getFormula(), /^=IFERROR/);
+  assert.match(wci.getRange('K6').getNote(),
+    /replaced the typed value "171" .*because Weight Log already has w:Him:2026-10-05 = 172\.4\.$/);
+
+  const note = wci.getRange('K6').getNote();
+  wci.getRange('K6').setValue(172.4); // the same weight Weight Log already has → nothing lost, no note
+  assert.deepEqual(gas.callPlain('setupDiced'), { migrated: 0, notMoved: 0 });
+  assert.equal(wci.getRange('K6').getNote(), note);
+});
+
+test('typed Weekly Check-in values that cannot be migrated are kept as cell notes, not silently dropped', () => {
+  const ss = wb.buildWorkbook();
+  const wci = ss.getSheetByName('Weekly Check-in');
+  wci.getRange('K5').setValue('201.4 lb'); // text, not a number
+  wci.getRange('E6').setValue(40).setNote('coach: re-weigh'); // out of range, cell already has a note
+  wci.getRange('E7').setValue('  '); // blank in all but name → nothing to keep
+  const gas = loadCode(ss);
+  assert.deepEqual(gas.callPlain('setupDiced'), { migrated: 1, notMoved: 2 });
+  assert.equal(wci.getRange('E7').getNote(), '');
+  assert.match(wci.getRange('K5').getFormula(), /^=IFERROR/);
+  assert.match(wci.getRange('K5').getNote(),
+    /^Diced setup \(\d{4}-\d{2}-\d{2}\) replaced the typed value "201\.4 lb" with the weekly average\. It was not copied into Weight Log because it is not a number\.$/);
+  assert.match(wci.getRange('E6').getFormula(), /^=IFERROR/);
+  assert.match(wci.getRange('E6').getNote(), /^coach: re-weigh\n\nDiced setup .*"40" .*outside 50–700 lb\.$/);
+  assert.match(ss.toasts.at(-1).message, /2 typed value\(s\) in Weekly Check-in could not be moved; each is kept as a note/);
+
+  // The phone has already synced Him's week-2 Monday; a different weight typed over the formula is kept.
+  const token = gas.scriptProps.getProperty('DICED_TOKEN');
+  const synced = gas.post({ token, action: 'upsertWeights', payload: { entries: [{
+    entryId: 'w:Him:2026-10-05', date: '2026-10-05', time: '07:00', person: 'Him', weightLb: 182,
+    source: 'photo', confidence: 'high', notes: '',
+  }] } });
+  assert.deepEqual(synced.data, { inserted: 1, updated: 0 });
+  wci.getRange('K6').setValue(181.5);
+  assert.deepEqual(gas.callPlain('setupDiced'), { migrated: 0, notMoved: 1 });
+  assert.match(wci.getRange('K6').getNote(), /"181\.5" .*Weight Log already has w:Him:2026-10-05 = 182\.$/);
+
+  // Repair stays idempotent once the notes are written.
+  const once = snapshot(ss);
+  assert.deepEqual(gas.callPlain('setupDiced'), { migrated: 0, notMoved: 0 });
+  assert.deepEqual(snapshot(ss), once);
 });
 
 test('Dashboard LOOKUP(2,1/(…)) formulas get wrapped in ARRAYFORMULA exactly once', () => {
@@ -285,7 +329,7 @@ test('setup tolerates a workbook without the plan tabs', () => {
   const ss = wb.buildWorkbook();
   ss.sheets = ss.sheets.filter((s) => !['Game Plan', 'Dashboard'].includes(s.getName()));
   const gas = loadCode(ss);
-  assert.deepEqual(gas.callPlain('setupDiced'), { migrated: 1 });
+  assert.deepEqual(gas.callPlain('setupDiced'), { migrated: 1, notMoved: 0 });
   assert.ok(ss.getSheetByName('Daily Log'));
 });
 
@@ -336,6 +380,17 @@ test('a pasted /exec URL is remembered when getUrl() only knows the /dev URL', (
   const gas = setUp({ webAppUrl: 'https://script.google.com/macros/s/head/dev' });
   assert.throws(() => gas.call('saveWebAppUrl', 'https://script.google.com/macros/s/head/dev'), /ending in \/exec/);
   assert.throws(() => gas.call('saveWebAppUrl', 'javascript:alert(1)//exec'), /ending in \/exec/);
+  // Only Apps Script hosts: nothing may point the phones (and their token) somewhere else.
+  for (const bad of [
+    'https://attacker.example/exec',
+    'https://script.google.com.attacker.example/macros/s/x/exec',
+    'https://attacker.example/script.google.com/macros/s/x/exec',
+    'https://script.google.com/macros/s/x/exec?next=https://attacker.example/exec',
+    'http://script.google.com/macros/s/x/exec',
+  ]) {
+    assert.throws(() => gas.call('saveWebAppUrl', bad), /ending in \/exec/, bad);
+  }
+  assert.equal(gas.scriptProps.getProperty('DICED_WEBAPP_URL'), null);
   assert.equal(gas.call('saveWebAppUrl', exec), true);
   assert.equal(gas.scriptProps.getProperty('DICED_WEBAPP_URL'), exec);
   gas.call('showConnectionInfo');
@@ -346,6 +401,60 @@ test('a pasted /exec URL is remembered when getUrl() only knows the /dev URL', (
   gas.env.webAppUrl = 'https://script.google.com/macros/s/newer/exec'; // a real /exec from getUrl wins
   gas.call('showConnectionInfo');
   assert.ok(gas.ui.dialogs.at(-1).html.includes('value="https://script.google.com/macros/s/newer/exec"'));
+});
+
+test('a stored URL that is not an Apps Script /exec URL is ignored', () => {
+  const gas = setUp({ webAppUrl: 'https://script.google.com/macros/s/head/dev' });
+  gas.scriptProps.setProperty('DICED_WEBAPP_URL', 'https://attacker.example/exec'); // e.g. saved by an older version
+  gas.call('showConnectionInfo');
+  const { html } = gas.ui.dialogs.at(-1);
+  assert.ok(!html.includes('attacker.example'));
+  assert.match(html, /ending in \/dev/);
+});
+
+test('the only external script in the token dialog is pinned with Subresource Integrity', () => {
+  const gas = setUp({ webAppUrl: 'https://script.google.com/macros/s/x/exec' });
+  gas.call('showConnectionInfo');
+  const { html } = gas.ui.dialogs[0];
+  const external = [...html.matchAll(/<script\b[^>]*\bsrc=[^>]*>/g)].map((m) => m[0]);
+  assert.deepEqual(external, [
+    '<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js" ' +
+      'integrity="sha512-CNgIRecGo7nphbeZ04Sc13ka07paqdeTu0WR1IM4kNcpmBAUSHSQX0FslNhTDadL4O5SAGapGt4FodqL8My0mA==" ' +
+      'crossorigin="anonymous" referrerpolicy="no-referrer">',
+  ]);
+});
+
+test('the dialog builds a link (and saves the URL) only for Apps Script /exec URLs', () => {
+  const gas = setUp({ webAppUrl: null });
+  gas.call('showConnectionInfo');
+  const [script] = [...gas.ui.dialogs[0].html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+  const el = (value = '') => ({
+    value, textContent: '', innerHTML: '', href: null,
+    removeAttribute(name) { this[name] = null; }, addEventListener() {},
+  });
+  const dom = { url: el(), link: el(), qr: el() };
+  const saved = [];
+  const run = { withFailureHandler() { return run; }, saveWebAppUrl(u) { saved.push(u); } };
+  function QRCode(node, opts) { node.qr = opts.text; }
+  QRCode.CorrectLevel = { M: 0 };
+  const page = vm.createContext({
+    document: { getElementById: (id) => dom[id] }, google: { script: { run } }, QRCode,
+    addEventListener() {}, encodeURIComponent,
+  });
+  page.window = page;
+  vm.runInContext(script, page);
+  const render = (url) => {
+    dom.url.value = url;
+    vm.runInContext('dicedRender()', page);
+    return dom.link.href;
+  };
+  assert.equal(render('https://attacker.example/exec'), null);
+  assert.equal(render('https://script.google.com.attacker.example/macros/s/x/exec'), null);
+  assert.deepEqual(saved, []);
+  const exec = 'https://script.google.com/a/macros/example.com/s/AKfy_1-2/exec';
+  assert.match(render(exec), /^diced:\/\/connect\?url=https%3A%2F%2Fscript\.google\.com%2Fa%2Fmacros/);
+  assert.deepEqual(saved, [exec]);
+  assert.equal(dom.qr.qr, dom.link.href);
 });
 
 test('the dialog script is valid JavaScript with the token JSON-embedded', () => {

@@ -1,16 +1,16 @@
-import { router, Stack, usePathname, type ErrorBoundaryProps } from 'expo-router';
-import { useEffect, useRef } from 'react';
+import { router, Stack, type ErrorBoundaryProps } from 'expo-router';
+import { useEffect } from 'react';
 import { ActivityIndicator, AppState, StyleSheet, Text, View } from 'react-native';
 import { getSettings } from '../config/settings';
 import { getDb } from '../db/database';
 import { errorMessage, logger } from '../lib/log';
 import { registerBackgroundTask } from '../scheduling/background';
-import { configureNotifications, listenForNotificationLinks, scheduleWeeklyReminder } from '../scheduling/notifications';
+import { configureNotifications, listenForNotificationLinks } from '../scheduling/notifications';
 import { runDueWorkInForeground } from '../ui/autoRun';
-import { screenRunsPipeline } from '../ui/autoRunPolicy';
 import { AutoRunBanner, Button, ErrorBanner } from '../ui/components';
 import { pathFromDeepLink } from '../ui/forms';
 import { useSettingsState } from '../ui/hooks';
+import { armWeeklyReminder } from '../ui/reminder';
 import { colors, spacing, type } from '../ui/theme';
 
 const log = logger('layout');
@@ -30,11 +30,6 @@ export function ErrorBoundary({ error, retry }: ErrorBoundaryProps) {
 
 export default function RootLayout() {
   const { settings, error, reload } = useSettingsState();
-  const pathname = usePathname();
-  const pathRef = useRef(pathname);
-  useEffect(() => {
-    pathRef.current = pathname;
-  }, [pathname]);
 
   const ready = settings !== null;
   const onboarded = settings?.onboardingComplete ?? false;
@@ -42,8 +37,14 @@ export default function RootLayout() {
   useEffect(() => {
     getDb().catch((e: unknown) => log.error(`database failed to open: ${errorMessage(e)}`));
     configureNotifications().catch((e: unknown) => log.warn(`notifications setup failed: ${errorMessage(e)}`));
-    registerBackgroundTask().catch(() => undefined);
   }, []);
+
+  // The background task only starts once setup (including the privacy choice) is finished; the
+  // task itself also does nothing before onboardingComplete. Registering again is harmless.
+  useEffect(() => {
+    if (!onboarded) return;
+    registerBackgroundTask().catch((e: unknown) => log.warn(`background task not registered: ${errorMessage(e)}`));
+  }, [onboarded]);
 
   // Subscribed only once the Stack is rendered, so a launching tap can navigate.
   useEffect(() => {
@@ -54,9 +55,11 @@ export default function RootLayout() {
     });
   }, [ready]);
 
+  // The catch-up stays out of the way only while a screen is actually running the pipeline
+  // (process-week holds that from its first effect), not merely because that screen is focused.
   useEffect(() => {
     if (!ready || !onboarded) return;
-    const catchUp = () => void runDueWorkInForeground({ skipProcessing: screenRunsPipeline(pathRef.current) });
+    const catchUp = () => void runDueWorkInForeground();
     catchUp();
     const sub = AppState.addEventListener('change', (next) => {
       if (next === 'active') catchUp();
@@ -65,11 +68,11 @@ export default function RootLayout() {
   }, [ready, onboarded]);
 
   // Re-arming once per launch keeps the reminder after an OS update/restore dropped it;
-  // schedule changes re-arm it from Settings.
+  // schedule / mode changes re-arm it from Settings. Manual mode has no weekly reminder.
   useEffect(() => {
     if (!onboarded) return;
     getSettings()
-      .then(scheduleWeeklyReminder)
+      .then(armWeeklyReminder)
       .catch((e: unknown) => log.warn(`weekly reminder not scheduled: ${errorMessage(e)}`));
   }, [onboarded]);
 

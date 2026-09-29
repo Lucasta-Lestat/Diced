@@ -220,19 +220,95 @@ describe('reconcileEstimate — restaurants', () => {
     servingNote: 'chicken, white rice, black beans, salsa',
   };
 
-  it('replaces the total with published nutrition', async () => {
+  it('uses published nutrition when the meal is that one item, keeping its grams editable', async () => {
     mockPublished.mockResolvedValue(published);
-    const input = estimate([item('chicken', 120, 200), item('rice', 150, 210)], { brand: 'Chipotle', confidence: 'low', title: 'Burrito bowl' });
+    const input = estimate([item('Chicken burrito bowl', 450, 410)], { brand: 'Chipotle', confidence: 'low', title: 'Burrito bowl' });
     const out = await reconcileEstimate(input, OPTS);
-    expect(mockPublished).toHaveBeenCalledWith('Chipotle', 'Burrito bowl');
-    expect(mockUsda).not.toHaveBeenCalled();
+    expect(mockPublished).toHaveBeenCalledWith('Chipotle', 'Chicken burrito bowl', { signal: undefined });
     expect(out.method).toBe('restaurant');
     expect(out.items).toHaveLength(1);
-    expect(out.items[0]).toMatchObject({ name: 'Chicken burrito bowl', source: 'web', grams: null, modelMacros: { kcal: 410 } });
+    // The model's served weight is kept, so a grams correction in review scales the published numbers.
+    expect(out.items[0]).toMatchObject({ name: 'Chicken burrito bowl', source: 'web', grams: 450, modelMacros: { kcal: 410 } });
     expect(out.totals).toEqual({ kcal: 655, proteinG: 53, carbsG: 62, fatG: 22 });
     expect(out.confidence).toBe('medium');
     expect(out.assumptions[0]).toMatch(/^Published nutrition for Chicken burrito bowl .*chipotle\.com.*photo estimate was 410 kcal$/);
     expect(out.kcalLow).toBe(Math.round(655 * (input.kcalLow / 410)));
+    expect(mockUsda).not.toHaveBeenCalled();
+  });
+
+  it('replaces only the item the published numbers are for and keeps sides and drinks', async () => {
+    mockPublished.mockResolvedValue({ source: 'https://www.mcdonalds.com/us/en-us/product/big-mac.html', itemName: "McDonald's Big Mac", macros: { kcal: 590, proteinG: 25, carbsG: 46, fatG: 34 }, servingNote: '1 sandwich' });
+    mockUsda.mockResolvedValue(usda(7, 312, 3.4, 41, 15));
+    const input = estimate(
+      [item('Big Mac', 215, 540), item('french fries', 110, 330), item('Coca-Cola', 590, 240, { usdaQuery: null })],
+      { brand: "McDonald's", title: 'Big Mac, fries and Coke', confidence: 'medium' },
+    );
+    const out = await reconcileEstimate(input, OPTS);
+    expect(mockPublished).toHaveBeenCalledWith("McDonald's", 'Big Mac, fries and Coke', { signal: undefined });
+    expect(out.items.map((i) => [i.name, i.source])).toEqual([
+      ["McDonald's Big Mac", 'web'],
+      ['french fries', 'usda'],
+      ['Coca-Cola', 'model'],
+    ]);
+    expect(out.items[0]).toMatchObject({ grams: 215, macros: { kcal: 590 } });
+    expect(out.totals.kcal).toBe(590 + Math.round(312 * 1.1) + 240);
+    expect(out.method).toBe('restaurant');
+    // Only part of the meal is published, so the meal's confidence isn't raised.
+    expect(out.confidence).toBe('medium');
+    expect(out.assumptions[0]).toMatch(/photo estimate was 540 kcal$/);
+  });
+
+  it("doesn't let a combo figure replace its main item (the sides are listed too)", async () => {
+    mockPublished.mockResolvedValue({ source: 'https://www.mcdonalds.com/combo', itemName: 'Big Mac Meal', macros: { kcal: 1080, proteinG: 30, carbsG: 140, fatG: 45 }, servingNote: 'medium' });
+    const input = estimate([item('Big Mac', 215, 540), item('french fries', 110, 330)], { brand: "McDonald's", title: 'Big Mac meal' });
+    const out = await reconcileEstimate(input, OPTS);
+    expect(out.items.map((i) => i.name)).toEqual(['Big Mac', 'french fries']);
+    expect(out.method).toBe('photo');
+    expect(out.assumptions[0]).toMatch(/for reference; the photo estimate is kept/);
+  });
+
+  it('keeps a dish itemised into components and only notes the published figure', async () => {
+    mockPublished.mockResolvedValue(published);
+    const input = estimate([item('chicken', 120, 200), item('rice', 150, 210)], { brand: 'Chipotle', confidence: 'low', title: 'Burrito bowl' });
+    const out = await reconcileEstimate(input, OPTS);
+    expect(mockPublished).toHaveBeenCalledWith('Chipotle', 'Burrito bowl', { signal: undefined });
+    // Replacing "chicken" with the whole bowl would count the rice twice.
+    expect(out.items.map((i) => i.name)).toEqual(['chicken', 'rice']);
+    expect(out.method).toBe('photo');
+    expect(out.confidence).toBe('low');
+    expect(out.totals.kcal).toBe(410);
+    expect(out.assumptions[0]).toMatch(/^Published nutrition for Chicken burrito bowl .*: 655 kcal \(for reference; the photo estimate is kept\)$/);
+    expect(mockUsda).toHaveBeenCalled();
+  });
+
+  it("doesn't let a published whole item override notes, answers or leftovers", async () => {
+    mockPublished.mockResolvedValue(published);
+    const whole = estimate([item('Chicken burrito bowl', 300, 520)], { brand: 'Chipotle', title: 'Burrito bowl' });
+    // "ate half" / "shared with partner" in notes or answers.
+    const noted = await reconcileEstimate(whole, { ...OPTS, userContext: true });
+    expect(noted.items[0].macros.kcal).toBe(520);
+    expect(noted.method).toBe('photo');
+    // Before/after photos: the model subtracted what was left.
+    const leftovers = await reconcileEstimate({ ...whole, assumptions: ['About a third of the bowl was left on the plate'] }, OPTS);
+    expect(leftovers.items[0].macros.kcal).toBe(520);
+    expect(mockPublished).not.toHaveBeenCalled();
+  });
+
+  it('passes the run\'s abort signal to the web lookup and starts no lookup once it has fired', async () => {
+    mockPublished.mockResolvedValue(null);
+    const controller = new AbortController();
+    const input = estimate([item('Chicken burrito bowl', 300, 520)], { brand: 'Chipotle', barcode: '5449000000996' });
+    await reconcileEstimate(input, { ...OPTS, signal: controller.signal });
+    expect(mockPublished).toHaveBeenCalledWith('Chipotle', 'Chicken burrito bowl', { signal: controller.signal });
+
+    jest.clearAllMocks();
+    controller.abort();
+    const out = await reconcileEstimate(input, { ...OPTS, signal: controller.signal });
+    expect(mockPublished).not.toHaveBeenCalled();
+    expect(mockBarcode).not.toHaveBeenCalled();
+    expect(mockUsda).not.toHaveBeenCalled();
+    // The model's numbers are kept.
+    expect(out.totals.kcal).toBe(520);
   });
 
   it('is skipped when web lookup is off or the method is not photo', async () => {

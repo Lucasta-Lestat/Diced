@@ -9,9 +9,10 @@ function byTime(a: PhotoRecord, b: PhotoRecord): number {
 }
 
 /**
- * Group food / nutrition-label photos (same local day) into meals: consecutive photos
- * less than `gapMinutes` apart form one group. Input may be unsorted; output groups
- * are sorted by first photo time.
+ * Group food / nutrition-label photos into meals: consecutive photos less than `gapMinutes`
+ * apart form one group, even across midnight (a 23:50 dinner and its 00:05 "after" photo are
+ * one meal, logged on the first photo's day). Input may be unsorted; output groups are sorted
+ * by first photo time.
  */
 export function groupMealPhotos(photos: PhotoRecord[], gapMinutes: number): PhotoRecord[][] {
   const gapMs = Math.max(0, Number.isFinite(gapMinutes) ? gapMinutes : 0) * 60_000;
@@ -19,7 +20,7 @@ export function groupMealPhotos(photos: PhotoRecord[], gapMinutes: number): Phot
   let current: PhotoRecord[] = [];
   for (const photo of [...photos].sort(byTime)) {
     const prev = current[current.length - 1];
-    if (prev && photo.localDate === prev.localDate && photo.creationTime - prev.creationTime < gapMs) {
+    if (prev && photo.creationTime - prev.creationTime < gapMs) {
       current.push(photo);
     } else {
       if (current.length > 0) groups.push(current);

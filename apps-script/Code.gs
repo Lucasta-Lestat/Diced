@@ -198,9 +198,20 @@ function saveWebAppUrl(url) {
   return true;
 }
 
+// Only Apps Script web-app URLs (consumer or Workspace form), so nothing can point the
+// phones — and their token — at another host. The dialog's client-side check reuses it.
+const DICED_EXEC_URL_RE =
+  /^https:\/\/script\.google\.com\/(?:macros|a\/macros\/[^\/\s]+|a\/[^\/\s]+\/macros)\/s\/[A-Za-z0-9_-]+\/exec$/;
+
 function isExecUrl_(url) {
-  return typeof url === 'string' && /^https:\/\/\S+\/exec$/.test(url);
+  return typeof url === 'string' && DICED_EXEC_URL_RE.test(url);
 }
+
+// qrcodejs 1.0.0 from cdnjs, pinned by hash (the value cdnjs publishes for this file).
+const DICED_QR_SCRIPT = {
+  src: 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js',
+  integrity: 'sha512-CNgIRecGo7nphbeZ04Sc13ka07paqdeTu0WR1IM4kNcpmBAUSHSQX0FslNhTDadL4O5SAGapGt4FodqL8My0mA==',
+};
 
 /** The deployed /exec URL if known, else whatever getUrl() says (a /dev URL or ''). */
 function webAppUrl_() {
@@ -211,7 +222,8 @@ function webAppUrl_() {
     url = '';
   }
   if (isExecUrl_(url)) return url;
-  return PropertiesService.getScriptProperties().getProperty(DICED_URL_KEY) || url;
+  const saved = PropertiesService.getScriptProperties().getProperty(DICED_URL_KEY);
+  return isExecUrl_(saved) ? saved : url;
 }
 
 function connectLink_(url, token) {
@@ -231,7 +243,9 @@ function escapeHtml_(s) {
  * Only an /exec URL works for the phones: the /dev URL (which getUrl() can return
  * when run from the editor) needs an editor's Google login. The page lets the user
  * paste the right URL and rebuilds the link + QR code client-side, so the token
- * never leaves the dialog.
+ * never leaves the dialog. The one external script (the QR encoder) runs in the same
+ * page as the token, so it is pinned with Subresource Integrity: a changed file is
+ * refused by the browser and the dialog falls back to "QR code unavailable".
  */
 function connectionInfoHtml_(url, token, setUp) {
   const deployed = isExecUrl_(url);
@@ -262,7 +276,8 @@ function connectionInfoHtml_(url, token, setUp) {
     '</style></head><body>',
     warnings.map(function (w) { return '<div class="warn">' + w + '</div>'; }).join(''),
     '<p>On each phone, scan the QR code with the camera (or open the link) — the Diced app fills in the ',
-    'sheet address and token for you. You can also paste both into the app\'s Settings.</p>',
+    'sheet address and token for you. You can also paste both on the app\'s <b>Connect the sheet</b> setup ',
+    'step (once set up: <b>Settings → Google Sheet → Change…</b>).</p>',
     '<label for="url">Web app URL</label>',
     '<input id="url" value="' + escapeHtml_(initialUrl) + '" placeholder="https://script.google.com/macros/s/…/exec">',
     '<label for="token">App token</label>',
@@ -272,14 +287,15 @@ function connectionInfoHtml_(url, token, setUp) {
     '<div id="qr"></div>',
     '<p class="muted">Keep the token private: anyone with the URL and token can read and write the logs. ',
     'Use <b>Diced → Rotate app token</b> if it leaks, then reconnect both phones.</p>',
-    '<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>',
+    '<script src="' + DICED_QR_SCRIPT.src + '" integrity="' + DICED_QR_SCRIPT.integrity +
+      '" crossorigin="anonymous" referrerpolicy="no-referrer"></script>',
     '<script>',
     'var DICED=' + data + ';',
     'function dicedRender(){',
     ' var url=document.getElementById("url").value.trim();',
     ' var a=document.getElementById("link"),qr=document.getElementById("qr");',
     ' qr.innerHTML="";',
-    ' if(!/^https:\\/\\/\\S+\\/exec$/.test(url)){a.removeAttribute("href");a.textContent="(paste the web app URL ending in /exec)";return;}',
+    ' if(!' + String(DICED_EXEC_URL_RE) + '.test(url)){a.removeAttribute("href");a.textContent="(paste the web app URL ending in /exec)";return;}',
     ' var link="diced://connect?url="+encodeURIComponent(url)+"&token="+encodeURIComponent(DICED.token);',
     ' a.href=link;a.textContent=link;',
     ' if(url!==DICED.saved&&window.google&&google.script){DICED.saved=url;google.script.run.withFailureHandler(function(){}).saveWebAppUrl(url);}',
@@ -302,15 +318,16 @@ function setupDiced() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const lock = LockService.getScriptLock();
   lock.waitLock(DICED_LOCK_MS);
-  let migrated = 0;
+  let migration = { migrated: 0, notMoved: [] };
   try {
     const weightLog = ensureLogTab_(ss, DICED_LOG_TABS.weight);
     ensureLogTab_(ss, DICED_LOG_TABS.meal);
     ensureLogTab_(ss, DICED_LOG_TABS.library);
     ensureDailyLog_(ss);
     // Migration must read the typed weights before the formulas replace them.
-    migrated = migrateCheckinWeights_(ss, weightLog);
+    migration = migrateCheckinWeights_(ss, weightLog);
     rewireCheckin_(ss);
+    noteUnmovedWeights_(ss, migration.notMoved);
     rewireDashboard_(ss);
     rewireGamePlan_(ss);
     ensureToken_();
@@ -320,9 +337,14 @@ function setupDiced() {
   } finally {
     lock.releaseLock();
   }
+  const migrated = migration.migrated;
+  const notMoved = migration.notMoved.length;
   const moved = migrated ? ' Moved ' + migrated + ' typed weight(s) into Weight Log.' : '';
-  ss.toast('Diced tabs are ready.' + moved + ' Next: Diced → Show app connection info.', 'Diced', 8);
-  return { migrated: migrated };
+  const kept = notMoved ? ' ' + notMoved + ' typed value(s) in Weekly Check-in could not be moved; ' +
+    'each is kept as a note on its cell.' : '';
+  ss.toast('Diced tabs are ready.' + moved + kept + ' Next: Diced → Show app connection info.', 'Diced',
+    notMoved ? 15 : 8);
+  return { migrated: migrated, notMoved: notMoved };
 }
 
 function ensureSheet_(ss, name, index) {
@@ -569,25 +591,53 @@ function ensureTodayRule_(sheet, range) {
 
 // ── Existing tabs ──
 
-/** Copies weights typed into Weekly Check-in (values, not formulas) into Weight Log, once. */
+/**
+ * Copies weights typed into Weekly Check-in (values, not formulas) into Weight Log, once.
+ * Returns { migrated, notMoved }: notMoved lists the typed cells that were not copied
+ * (not a number from 50 to 700, no known Monday, or that Monday already has a different
+ * weight in Weight Log) so setup can keep them as cell notes before the formulas replace them.
+ */
 function migrateCheckinWeights_(ss, weightLog) {
+  const result = { migrated: 0, notMoved: [] };
   const checkin = ss.getSheetByName(DICED_SHEETS.checkin);
-  if (!checkin) return 0;
+  if (!checkin) return result;
+  const tab = DICED_LOG_TABS.weight;
   const tz = ss.getSpreadsheetTimeZone();
   const weeks = checkin.getRange(DICED_FIRST_ROW, 1, DICED_PLAN_WEEKS, 2).getValues();
+  const has = function (obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); };
+  const logged = {}; // Entry ID → weight already in Weight Log (or queued below)
+  readRecords_(weightLog, tab).forEach(function (r) {
+    const id = String(r.record.entryId).trim();
+    if (id !== '' && !has(logged, id)) logged[id] = r.record.weightLb;
+  });
   const loggedAt = new Date();
   const records = [];
   DICED_CONFIG.people.forEach(function (p) {
-    const range = checkin.getRange(DICED_FIRST_ROW, colIndex_(p.checkinWeightCol), DICED_PLAN_WEEKS, 1);
+    const col = colIndex_(p.checkinWeightCol);
+    const range = checkin.getRange(DICED_FIRST_ROW, col, DICED_PLAN_WEEKS, 1);
     const values = range.getValues();
     const formulas = range.getFormulas();
     values.forEach(function (row, i) {
-      const typed = formulas[i][0] === '' && row[0] !== '' && row[0] !== null;
-      const lb = typed ? Number(row[0]) : NaN;
-      if (!isFinite(lb) || lb < 50 || lb > 700) return;
+      const typed = row[0];
+      if (formulas[i][0] !== '' || typed === null || String(typed).trim() === '') return;
+      const notMoved = function (reason) {
+        result.notMoved.push({ row: DICED_FIRST_ROW + i, col: col, value: typed, reason: reason });
+      };
+      const lb = Number(typed);
+      if (!isFinite(lb)) return notMoved('it is not a number');
+      if (lb < 50 || lb > 700) return notMoved('it is outside 50–700 lb');
       const monday = weekMonday_(ss, weeks[i][1], weeks[i][0]);
-      if (!monday) return;
+      if (!monday) return notMoved("the week's Monday date is unknown");
       const ymd = Utilities.formatDate(monday, tz, 'yyyy-MM-dd');
+      const entryId = 'w:' + p.label + ':' + ymd;
+      if (has(logged, entryId)) {
+        // Same weight already logged (e.g. by the phone) → nothing is lost.
+        if (Number(logged[entryId]) !== lb) {
+          notMoved('Weight Log already has ' + entryId + ' = ' + displayValue_(logged[entryId], tz));
+        }
+        return;
+      }
+      logged[entryId] = lb;
       records.push({
         date: Utilities.parseDate(ymd, tz, 'yyyy-MM-dd'),
         person: p.label,
@@ -596,12 +646,34 @@ function migrateCheckinWeights_(ss, weightLog) {
         source: 'migrated',
         confidence: 'high',
         notes: 'Typed in Weekly Check-in before Diced was set up',
-        entryId: 'w:' + p.label + ':' + ymd,
+        entryId: entryId,
         loggedAt: loggedAt,
       });
     });
   });
-  return insertMissing_(weightLog, DICED_LOG_TABS.weight, records);
+  if (records.length) upsertRows_(weightLog, tab, records);
+  result.migrated = records.length;
+  return result;
+}
+
+/** Keeps each typed Weekly Check-in value that was not migrated as a note on its cell. */
+function noteUnmovedWeights_(ss, notMoved) {
+  if (!notMoved.length) return;
+  const sheet = ss.getSheetByName(DICED_SHEETS.checkin);
+  const tz = ss.getSpreadsheetTimeZone();
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  notMoved.forEach(function (c) {
+    const cell = sheet.getRange(c.row, c.col);
+    const text = 'Diced setup (' + today + ') replaced the typed value "' + displayValue_(c.value, tz) +
+      '" with the weekly average. It was not copied into Weight Log because ' + c.reason + '.';
+    const old = cell.getNote();
+    cell.setNote(old ? old + '\n\n' + text : text);
+  });
+}
+
+function displayValue_(v, tz) {
+  if (isDate_(v)) return Utilities.formatDate(v, tz, 'yyyy-MM-dd');
+  return v === '' || v === null || v === undefined ? '(blank)' : String(v);
 }
 
 function weekMonday_(ss, value, week) {
@@ -1051,16 +1123,6 @@ function readRecords_(sheet, tab) {
     });
 }
 
-function lastRowWithDate_(sheet) {
-  const last = sheet.getLastRow();
-  if (last < DICED_FIRST_ROW) return DICED_FIRST_ROW - 1;
-  const col = sheet.getRange(DICED_FIRST_ROW, 1, last - DICED_FIRST_ROW + 1, 1).getValues();
-  for (let i = col.length - 1; i >= 0; i--) {
-    if (col[i][0] !== '' && col[i][0] !== null) return DICED_FIRST_ROW + i;
-  }
-  return DICED_FIRST_ROW - 1;
-}
-
 function toRow_(tab, record) {
   return tab.columns.map(function (c) {
     const v = record[c.key];
@@ -1086,18 +1148,17 @@ function upsertInto_(ctx, tab, records, stampLoggedAt) {
 
 /**
  * Overwrites rows whose Entry ID matches in place; appends the rest after the last
- * row with data in column A (or with an Entry ID, so such a row is never clobbered).
+ * row with any content (getLastRow), so a hand-typed row without a Date or Entry ID,
+ * or a note below the data, is never overwritten.
  * Duplicate IDs within one batch collapse into one row holding the last values.
  */
 function upsertRows_(sheet, tab, records) {
   const has = function (obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); };
   const width = tab.columns.length;
   const existing = {};
-  let lastUsed = lastRowWithDate_(sheet);
+  const lastUsed = Math.max(DICED_FIRST_ROW - 1, sheet.getLastRow());
   readIds_(sheet, tab).forEach(function (id, i) {
-    if (id === '') return;
-    if (!has(existing, id)) existing[id] = DICED_FIRST_ROW + i;
-    lastUsed = Math.max(lastUsed, DICED_FIRST_ROW + i);
+    if (id !== '' && !has(existing, id)) existing[id] = DICED_FIRST_ROW + i;
   });
   const pending = {};
   const appends = [];
@@ -1123,15 +1184,6 @@ function upsertRows_(sheet, tab, records) {
     sheet.getRange(lastUsed + 1, 1, appends.length, width).setValues(appends);
   }
   return { inserted: inserted, updated: updated };
-}
-
-/** Appends only records whose Entry ID is not in the sheet yet; returns how many. */
-function insertMissing_(sheet, tab, records) {
-  const existing = {};
-  readIds_(sheet, tab).forEach(function (id) { existing[id] = true; });
-  const fresh = records.filter(function (r) { return !existing[r.entryId]; });
-  if (fresh.length) upsertRows_(sheet, tab, fresh);
-  return fresh.length;
 }
 
 /** Deletes the given 1-based rows, bottom-up in contiguous runs so indexes stay valid. */

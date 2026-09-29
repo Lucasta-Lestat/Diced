@@ -5,7 +5,7 @@ import { requestSync } from '../autoRun';
 import type { MealEntry } from '../../types';
 import { formatKcal, formatMacros, kcalPlusMinus, plural, slotText } from '../format';
 import { useAction } from '../hooks';
-import { unansweredQuestions } from '../reviewModel';
+import { splitAssumptions, unansweredQuestions } from '../reviewModel';
 import { colors, spacing, type } from '../theme';
 import { Badge, ConfidenceBadge, StatusBadge } from './Badge';
 import { Button } from './Button';
@@ -42,6 +42,8 @@ export function MealCard({ meal, photoUri, onChanged }: MealCardProps) {
   const open = () => router.push({ pathname: '/review/meal/[id]', params: { id: meal.id } });
   const est = meal.estimate;
   const questions = unansweredQuestions(meal).length;
+  // Why "Approve all confident" skips this meal (USDA and Claude disagree on a portion).
+  const checkPortions = splitAssumptions(est?.assumptions ?? []).checkPortions.length;
   const range = est ? kcalPlusMinus(est.kcalLow, est.kcalHigh) : null;
   const title = meal.title || est?.title || slotText(meal.slot);
   const busy = approve.pending || reject.pending;
@@ -74,6 +76,7 @@ export function MealCard({ meal, photoUri, onChanged }: MealCardProps) {
 
       <View style={styles.badges}>
         {est ? <ConfidenceBadge confidence={est.confidence} /> : null}
+        {checkPortions > 0 ? <Badge label="Check portion" tone="warning" accessibilityLabel={`Check the portion of ${plural(checkPortions, 'item')}`} /> : null}
         {questions > 0 ? <Badge label={plural(questions, 'question')} tone="info" /> : null}
         {meal.status !== 'needs_review' ? <StatusBadge status={meal.status} /> : null}
       </View>

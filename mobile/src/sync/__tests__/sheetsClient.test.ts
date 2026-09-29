@@ -188,6 +188,36 @@ describe('pingSheet / sheet info', () => {
     await expect(pingSheet(URL, ' ')).rejects.toMatchObject({ code: 'not_configured' });
   });
 
+  it('never sends the token anywhere but a script.google.com /exec URL (same rule as Code.gs)', async () => {
+    const refused = [
+      'https://evil.example/exec',
+      'https://script.google.com.evil.example/macros/s/abc/exec',
+      'https://script.google.com@evil.example/macros/s/abc/exec',
+      'https://evil.example/script.google.com/macros/s/abc/exec',
+      'https://script.google.com/macros/s/abc/exec?next=https://evil.example',
+      'https://script.googleusercontent.com/macros/echo?user_content_key=x',
+      'https://script.google.com/macros/s/abc/dev',
+      'https://script.google.com/macros/s//exec',
+    ];
+    for (const url of refused) {
+      await expect(pingSheet(url, 'tok')).rejects.toMatchObject({ code: 'not_configured' });
+    }
+    await expect(pingSheet('https://script.google.com/macros/s/abc/dev', 'tok')).rejects.toThrow(/\/dev test URL/);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    mockGetSettings.mockResolvedValue({ ...DEFAULT_SETTINGS, sheetWebAppUrl: 'https://evil.example/exec' });
+    await expect(getSheetsClient()).rejects.toMatchObject({ code: 'not_configured' });
+
+    for (const url of [
+      'https://script.google.com/a/macros/example.com/s/AKfy_c-1/exec',
+      'https://script.google.com/a/example.com/macros/s/AKfy_c-1/exec',
+    ]) {
+      reply(200, JSON.stringify({ ok: true, data: PING }));
+      expect(await pingSheet(url, 'tok')).toEqual(PING);
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('refreshSheetInfo caches the ping in kv; getSheetInfo ignores info for another URL', async () => {
     jest.spyOn(Date, 'now').mockReturnValue(1234);
     reply(200, JSON.stringify({ ok: true, data: PING }));

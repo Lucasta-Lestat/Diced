@@ -131,10 +131,13 @@ describe('testAnthropicKey', () => {
 
   it('explains a rejected key, an unknown model and a missing key', async () => {
     setAnthropicClientForTests(fakeAnthropic(() => ({ status: 401, body: errorBody('authentication_error', 'invalid x-api-key') })).client);
-    expect(await testAnthropicKey()).toEqual({ ok: false, message: expect.stringMatching(/key rejected/) });
+    expect(await testAnthropicKey()).toEqual({ ok: false, message: expect.stringMatching(/key rejected/), kind: 'auth' });
 
     setAnthropicClientForTests(fakeAnthropic(() => ({ status: 404, body: errorBody('not_found_error', 'model') })).client);
-    expect(await testAnthropicKey()).toEqual({ ok: false, message: expect.stringMatching(/was not found/) });
+    expect(await testAnthropicKey()).toEqual({ ok: false, message: expect.stringMatching(/was not found/), kind: 'not_found' });
+
+    setAnthropicClientForTests(fakeAnthropic(() => ({ status: 429, body: errorBody('rate_limit_error', 'slow down') })).client);
+    expect(await testAnthropicKey()).toEqual({ ok: false, message: expect.any(String), kind: 'rate_limit' });
 
     setAnthropicClientForTests(null);
     mockGetSecret.mockResolvedValue(null);

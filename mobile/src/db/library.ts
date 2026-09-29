@@ -43,7 +43,8 @@ export interface LibraryMergePlan {
 /**
  * Pure merge decision: sheet wins unless the local copy is unsynced and newer; local
  * items missing from the sheet survive only while unsynced (otherwise someone deleted
- * the row in the sheet).
+ * the row in the sheet). The use count always comes from the sheet (both phones add to it),
+ * and uses this phone hasn't pushed yet (`pendingUses`) are kept on top of it.
  */
 export function planLibraryMerge(local: LibraryItem[], sheet: LibraryItem[]): LibraryMergePlan {
   const localById = new Map(local.map((i) => [i.id, i]));
@@ -52,8 +53,13 @@ export function planLibraryMerge(local: LibraryItem[], sheet: LibraryItem[]): Li
   for (const remote of sheet) {
     sheetIds.add(remote.id);
     const mine = localById.get(remote.id);
-    if (mine && !mine.synced && mine.updatedAt > remote.updatedAt) continue;
-    upsert.push({ ...remote, synced: true });
+    if (mine && !mine.synced && mine.updatedAt > remote.updatedAt) {
+      // This phone's edit is newer: keep it, but count the uses the sheet has.
+      if (mine.uses !== remote.uses) upsert.push({ ...mine, uses: remote.uses });
+      continue;
+    }
+    const pending = mine?.pendingUses ? { pendingUses: mine.pendingUses } : {};
+    upsert.push({ ...remote, synced: true, ...pending });
   }
   const remove = local.filter((i) => !sheetIds.has(i.id) && i.synced).map((i) => i.id);
   return { upsert, remove };
@@ -77,11 +83,13 @@ export async function mergeLibraryFromSheet(items: LibraryItem[]): Promise<void>
   });
 }
 
-/** Oldest change first. */
+/** Items to push: unsynced content or uses not yet added to the sheet's count. Oldest change first. */
 export async function listUnsyncedLibrary(): Promise<LibraryItem[]> {
   const db = await getDb();
   const rows = await db.getAllAsync<{ data: string }>(
-    'SELECT data FROM library WHERE synced = 0 ORDER BY updated_at, id',
+    `SELECT data FROM library
+     WHERE synced = 0 OR COALESCE(json_extract(data, '$.pendingUses'), 0) > 0
+     ORDER BY updated_at, id`,
   );
   return rows.map((r) => parseData<LibraryItem>(r.data));
 }
@@ -98,12 +106,36 @@ export async function markLibrarySynced(ids: string[]): Promise<void> {
   }
 }
 
-/** Like markLibrarySynced, but skips items changed since they were read (updatedAt differs). */
-export async function markLibraryItemsSynced(items: { id: string; updatedAt: number }[]): Promise<number> {
+/**
+ * After a push: the `pendingUses` that were sent (pushed as part of the sheet's count) move into
+ * `uses`, and items not changed since they were read (same updatedAt) are marked synced. Returns
+ * # marked synced.
+ */
+export async function markLibraryItemsSynced(
+  items: { id: string; updatedAt: number; pendingUses?: number }[],
+): Promise<number> {
   if (items.length === 0) return 0;
   return withTransaction(async (db) => {
     let marked = 0;
     for (const item of items) {
+      const sent = item.pendingUses ?? 0;
+      if (sent > 0) {
+        // Uses counted while the request was in flight stay pending.
+        await db.runAsync(
+          `UPDATE library SET data = CASE
+             WHEN COALESCE(json_extract(data, '$.pendingUses'), 0) - ? > 0
+               THEN json_set(data, '$.uses', COALESCE(json_extract(data, '$.uses'), 0) + ?,
+                                   '$.pendingUses', COALESCE(json_extract(data, '$.pendingUses'), 0) - ?)
+             ELSE json_remove(json_set(data, '$.uses', COALESCE(json_extract(data, '$.uses'), 0) + ?), '$.pendingUses')
+           END
+           WHERE id = ?`,
+          sent,
+          sent,
+          sent,
+          sent,
+          item.id,
+        );
+      }
       const r = await db.runAsync(
         `UPDATE library SET synced = 1, data = json_set(data, '$.synced', json('true'))
          WHERE id = ? AND updated_at = ?`,
@@ -116,19 +148,16 @@ export async function markLibraryItemsSynced(items: { id: string; updatedAt: num
   });
 }
 
-/** uses + 1; the item becomes unsynced so the new count reaches the sheet. */
+/**
+ * One more use, counted as pending: the next sync adds it to the sheet's count. The item's content
+ * and updatedAt are untouched, so a stale local copy never looks newer than an edit made on the
+ * other phone (which would overwrite it).
+ */
 export async function incrementLibraryUse(id: string): Promise<void> {
   const db = await getDb();
-  const now = Date.now();
   await db.runAsync(
-    `UPDATE library SET synced = 0, updated_at = ?,
-       data = json_set(data,
-         '$.uses', COALESCE(json_extract(data, '$.uses'), 0) + 1,
-         '$.updatedAt', ?,
-         '$.synced', json('false'))
+    `UPDATE library SET data = json_set(data, '$.pendingUses', COALESCE(json_extract(data, '$.pendingUses'), 0) + 1)
      WHERE id = ?`,
-    now,
-    now,
     id,
   );
 }

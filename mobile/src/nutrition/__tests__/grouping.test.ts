@@ -40,9 +40,9 @@ describe('groupMealPhotos', () => {
     expect(ids(groupMealPhotos(photos, 20))).toEqual([['a'], ['b']]);
   });
 
-  it('never groups across local days', () => {
-    const photos = [photo('late', at(28, 23, 55)), photo('early', at(29, 0, 5))];
-    expect(ids(groupMealPhotos(photos, 20))).toEqual([['late'], ['early']]);
+  it('keeps a meal that crosses midnight together (the after photo is not a second meal)', () => {
+    const photos = [photo('dinner', at(28, 23, 50)), photo('after', at(29, 0, 5)), photo('breakfast', at(29, 8, 0))];
+    expect(ids(groupMealPhotos(photos, 20))).toEqual([['dinner', 'after'], ['breakfast']]);
   });
 
   it('orders simultaneous photos by asset id and handles empty input', () => {

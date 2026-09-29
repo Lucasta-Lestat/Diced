@@ -11,10 +11,11 @@ import { readScale, toPounds, type ScaleReading } from '../ai/scale';
 import { getSettings, updateSettings } from '../config/settings';
 import { chunk } from '../db/database';
 import { listLibrary } from '../db/library';
-import { listMeals, upsertMeal } from '../db/meals';
+import { getMeal, listMeals, upsertMeal } from '../db/meals';
 import {
   getPhotos,
   insertNewPhotos,
+  listPickedPhotos,
   listUnclassified,
   listUnprocessed,
   markProcessed,
@@ -27,7 +28,8 @@ import { formatDayLabel, toLocalDate, toLocalTime } from '../lib/dates';
 import { newId, weightEntryId } from '../lib/ids';
 import { errorMessage, logger } from '../lib/log';
 import { groupMealPhotos, guessMealSlot } from '../nutrition/grouping';
-import { makeThumbnail, prepareForModel } from '../photos/images';
+import { CAPTURE_DIR, isLibraryAssetId, PICKED_DIR, SAME_PHOTO_TOLERANCE_MS, withoutPickedDuplicates } from '../photos/appFiles';
+import { makeThumbnail, prepareScaleImage } from '../photos/images';
 import { listPhotosInRange, resolveReadableUri } from '../photos/scanner';
 import { nextScanWindow, shiftLocalDays } from '../scheduling/due';
 import { notifyReviewReady } from '../scheduling/notifications';
@@ -35,7 +37,9 @@ import type {
   AppSettings,
   EntryStatus,
   LibraryItem,
+  MealEntry,
   PersonLabel,
+  PhotoAsset,
   PhotoCategory,
   PhotoRecord,
   ProcessProgress,
@@ -45,8 +49,9 @@ import type {
   WeightEntry,
   WeightUnit,
 } from '../types';
-import { mapLimit, withWeightLock } from './concurrency';
+import { createLock, mapLimit, withWeightLock } from './concurrency';
 import { estimateAndReconcile, isEmptyEstimate, loadMealImages, newMealEntry } from './mealEstimate';
+import { answeredQuestions, withNewEstimate } from './mealRevision';
 import {
   hasPresetCategory,
   modelConfidence,
@@ -77,7 +82,11 @@ const THUMBNAIL_CONCURRENCY = 4;
 const MAX_RUN_ERRORS = 25;
 /** History used for the weigh-in trend check and to disambiguate scale digits. */
 const RECENT_WEIGHT_DAYS = 30;
-const CAPTURE_DIR = 'captures';
+/**
+ * A photo showing only leftovers joins an earlier meal (still in review) taken up to this long
+ * before it: people often photograph the plate again well after the 20-minute grouping gap.
+ */
+export const LEFTOVERS_ATTACH_MINUTES = 90;
 const PHOTO_GONE = 'Photo no longer available';
 const AUTOMATIC_REASONS: readonly RunReason[] = ['weekly', 'daily', 'background'];
 const LIVE_MEAL_STATUSES: EntryStatus[] = ['needs_review', 'approved', 'synced', 'sync_error'];
@@ -97,6 +106,8 @@ let sideJobs = 0;
  * no photo is read or estimated twice (which would create a duplicate meal).
  */
 const claimed = new Set<string>();
+/** Adding photos to a meal in review is a read-estimate-write of that meal; one at a time. */
+const withMealAttachLock = createLock();
 
 function claim<T extends { assetId: string }>(items: T[]): T[] {
   const mine = items.filter((p) => !claimed.has(p.assetId));
@@ -125,6 +136,16 @@ class RunContext {
   readonly result: ProcessResult;
   /** A run-stopping AI error happened (no key, rate limit, offline…). */
   halted = false;
+  /**
+   * Automatic runs leave a meal whose last photo is younger than the grouping gap for the next
+   * run: more photos of it (the "after" photo) may still come, and estimating now splits it.
+   */
+  readonly holdRecentMeals: boolean;
+  /**
+   * Capture times of photos whose classification failed in this run for the first time: they may
+   * be more photos of a nearby meal, so that meal waits for the next run (once).
+   */
+  readonly unsortedTimes: number[] = [];
 
   constructor(
     readonly settings: AppSettings,
@@ -135,6 +156,7 @@ class RunContext {
     readonly signal?: AbortSignal,
     private readonly onProgress?: (p: ProcessProgress) => void,
   ) {
+    this.holdRecentMeals = AUTOMATIC_REASONS.includes(reason);
     this.result = {
       reason,
       windowStart: window.startMs,
@@ -228,10 +250,27 @@ function retryRange(window: { startMs: number; endMs: number }): { startMs: numb
 // Stage 1: scan
 // ---------------------------------------------------------------------------
 
+/**
+ * Drops library photos the user already hand-picked when the picker couldn't name their library
+ * id (stored as `picked:<file name>`, see ui/photoPicker.ts), so they aren't logged a second time.
+ */
+async function withoutPickedCopies(assets: PhotoAsset[]): Promise<PhotoAsset[]> {
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const a of assets) {
+    if (!a.filename) continue;
+    min = Math.min(min, a.creationTime);
+    max = Math.max(max, a.creationTime);
+  }
+  if (min > max) return assets;
+  const picked = await listPickedPhotos(min - SAME_PHOTO_TOLERANCE_MS, max + SAME_PHOTO_TOLERANCE_MS);
+  return picked.length ? withoutPickedDuplicates(assets, picked) : assets;
+}
+
 async function scanStage(ctx: RunContext, window: { startMs: number; endMs: number }): Promise<void> {
   ctx.progress('scanning', 0, 0, 'Looking for new photos…');
   try {
-    const assets = await listPhotosInRange(window.startMs, window.endMs);
+    const assets = await withoutPickedCopies(await listPhotosInRange(window.startMs, window.endMs));
     const now = Date.now();
     const records = assets.map((a) => photoRecordFromAsset(a, now));
     await insertNewPhotos(records);
@@ -262,7 +301,16 @@ async function thumbnailFailed(ctx: RunContext, record: PhotoRecord, e: unknown)
     await setPhotoErrorQuietly(record.assetId, PHOTO_GONE);
     return;
   }
+  if (!isCancelled(e)) unsorted(ctx, record);
   await photoFailed(ctx, record, e);
+}
+
+/**
+ * A photo left unclassified by a failure. Only its first failure holds nearby meals back; a photo
+ * that keeps failing (e.g. an image Claude can't read) must not block its meal forever.
+ */
+function unsorted(ctx: RunContext, record: PhotoRecord): void {
+  if (record.error === null) ctx.unsortedTimes.push(record.creationTime);
 }
 
 async function classifyOneBatch(ctx: RunContext, batch: PhotoRecord[]): Promise<void> {
@@ -283,6 +331,8 @@ async function classifyOneBatch(ctx: RunContext, batch: PhotoRecord[]): Promise<
   } catch (e) {
     if (isCancelled(e)) return ctx.aiFailed(e);
     const message = errorMessage(e);
+    const sent = new Set(inputs.map((i) => i.assetId));
+    for (const record of batch) if (sent.has(record.assetId)) unsorted(ctx, record);
     for (const input of inputs) await setPhotoErrorQuietly(input.assetId, message);
     ctx.addError(`Couldn't sort ${inputs.length} photos: ${message}`);
     ctx.aiFailed(e);
@@ -362,7 +412,7 @@ async function readScalePhoto(
 ): Promise<ScaleOutcome> {
   const uri = await resolveReadableUri(record.assetId, record.uri);
   if (!uri) return { kind: 'gone' };
-  const image = await prepareForModel(uri);
+  const image = await prepareScaleImage(uri);
   const reading = await readScale(image, { expectedUnit: settings.scaleUnit, recentLb }, { signal });
   const candidate = readingToCandidate(record, reading, settings.scaleUnit);
   return candidate ? { kind: 'reading', candidate } : { kind: 'unreadable' };
@@ -470,9 +520,125 @@ async function loadLibrary(): Promise<LibraryItem[]> {
   }
 }
 
-async function estimateGroup(ctx: RunContext, group: PhotoRecord[], library: LibraryItem[]): Promise<void> {
+function mealGapMs(settings: AppSettings): number {
+  const minutes = settings.mealGroupingMinutes;
+  return Math.max(0, Number.isFinite(minutes) ? minutes : 0) * 60_000;
+}
+
+function byTime(a: PhotoRecord, b: PhotoRecord): number {
+  return a.creationTime - b.creationTime || (a.assetId < b.assetId ? -1 : a.assetId > b.assetId ? 1 : 0);
+}
+
+/** Meals left for the next run so that one meal isn't split across two runs. */
+function heldBack(ctx: RunContext, group: PhotoRecord[], gapMs: number, now: number): boolean {
+  const first = group[0].creationTime;
+  const last = group[group.length - 1].creationTime;
+  const age = now - last;
+  if (ctx.holdRecentMeals && age >= 0 && age < gapMs) return true;
+  return ctx.unsortedTimes.some((t) => t > first - gapMs && t < last + gapMs);
+}
+
+/**
+ * A meal still in review (this person's) that `group` belongs to: its photos are less than
+ * `windowMs` from the group's ('either': on either side; 'before': the meal ended before the group
+ * started). The closest one wins; null when none.
+ */
+async function findMealInReview(
+  person: PersonLabel,
+  group: PhotoRecord[],
+  windowMs: number,
+  side: 'either' | 'before',
+): Promise<MealEntry | null> {
+  const first = group[0].creationTime;
+  const last = group[group.length - 1].creationTime;
+  const groupIds = new Set(group.map((p) => p.assetId));
+  const meals = await listMeals({
+    person,
+    statuses: ['needs_review'],
+    from: toLocalDate(first - windowMs),
+    to: toLocalDate(last + windowMs),
+  });
+  let best: MealEntry | null = null;
+  let bestGap = Number.POSITIVE_INFINITY;
+  for (const meal of meals) {
+    if (meal.assetIds.length === 0 || meal.assetIds.some((id) => groupIds.has(id))) continue;
+    const times = (await getPhotos(meal.assetIds)).map((p) => p.creationTime);
+    if (times.length === 0) continue;
+    const mealFirst = Math.min(...times);
+    const mealLast = Math.max(...times);
+    const gap =
+      side === 'before' ? (mealLast <= first ? first - mealLast : Number.POSITIVE_INFINITY) : Math.max(mealFirst - last, first - mealLast);
+    if (gap < windowMs && gap < bestGap) {
+      best = meal;
+      bestGap = gap;
+    }
+  }
+  return best;
+}
+
+/** Who / how a meal is estimated for (a run, or a quick-log capture). */
+type MealJob = { person: PersonLabel; settings: AppSettings; signal?: AbortSignal };
+
+/**
+ * Adds `group` to a meal still in review that it belongs to, re-estimating the meal with all its
+ * photos (so an "after" photo subtracts leftovers instead of becoming a second meal). Returns the
+ * updated meal, or null when there is no such meal, or it left review / was edited while Claude
+ * was working (the group is then handled on its own).
+ */
+async function addToMealInReview(
+  job: MealJob,
+  group: PhotoRecord[],
+  library: LibraryItem[],
+  windowMs: number,
+  side: 'either' | 'before',
+): Promise<MealEntry | null> {
+  if (group.length === 0 || !(windowMs > 0)) return null;
+  const target = await findMealInReview(job.person, group, windowMs, side);
+  if (!target) return null;
+  return withMealAttachLock(async () => {
+    const meal = await getMeal(target.id);
+    if (!meal || meal.status !== 'needs_review') return null;
+    const known = new Set(meal.assetIds);
+    const photos = [...(await getPhotos(meal.assetIds)), ...group.filter((p) => !known.has(p.assetId))].sort(byTime);
+    const { images } = await loadMealImages(photos);
+    if (images.length === 0) return null;
+    const estimate = await estimateAndReconcile({
+      images,
+      slot: meal.slot,
+      notes: meal.notes,
+      answers: answeredQuestions(meal),
+      library,
+      hint: `${meal.title} ${meal.notes}`,
+      settings: job.settings,
+      signal: job.signal,
+    });
+    if (isEmptyEstimate(estimate)) return null;
+    const latest = await getMeal(meal.id);
+    if (!latest || latest.updatedAt !== meal.updatedAt) return null;
+    // New photos taken before the meal's first one move its start (a retried earlier photo).
+    const first = photos[0];
+    const start = known.has(first.assetId)
+      ? {}
+      : { localDate: toLocalDate(first.creationTime), time: toLocalTime(first.creationTime) };
+    const updated = withNewEstimate({ ...meal, ...start, assetIds: photos.map((p) => p.assetId) }, estimate, Date.now());
+    await upsertMeal(updated);
+    return updated;
+  });
+}
+
+async function estimateGroup(
+  ctx: RunContext,
+  group: PhotoRecord[],
+  library: LibraryItem[],
+  earlierGroupsDone: () => Promise<unknown>,
+): Promise<void> {
   const ids = group.map((p) => p.assetId);
   try {
+    // More photos of a meal an earlier run already put in review (e.g. its "after" photo).
+    if (await addToMealInReview(ctx, group, library, mealGapMs(ctx.settings), 'either')) {
+      await markProcessed(ids);
+      return;
+    }
     const { images, missing } = await loadMealImages(group);
     if (images.length === 0) {
       await markProcessed(ids);
@@ -489,8 +655,17 @@ async function estimateGroup(ctx: RunContext, group: PhotoRecord[], library: Lib
       settings: ctx.settings,
       signal: ctx.signal,
     });
+    const present = group.filter((p) => !missing.includes(p.assetId));
+    if (estimate.leftoversOnly) {
+      // Only leftovers: the "after" photo of an earlier meal, once that meal (possibly estimated
+      // in this same run) is saved. Its leftovers are then subtracted rather than logged as eaten.
+      await earlierGroupsDone();
+      if (await addToMealInReview(ctx, present, library, LEFTOVERS_ATTACH_MINUTES * 60_000, 'before')) {
+        await markProcessed(ids);
+        return;
+      }
+    }
     if (!isEmptyEstimate(estimate)) {
-      const present = group.filter((p) => !missing.includes(p.assetId));
       await upsertMeal(newMealEntry(ctx.person, present, estimate, Date.now()));
       ctx.result.mealsCreated++;
     }
@@ -506,16 +681,26 @@ async function estimateGroup(ctx: RunContext, group: PhotoRecord[], library: Lib
 
 async function foodStage(ctx: RunContext, records: PhotoRecord[]): Promise<void> {
   if (records.length === 0) return;
-  ctx.result.foodPhotos += records.length;
-  const groups = groupMealPhotos(records, ctx.settings.mealGroupingMinutes);
+  const gapMs = mealGapMs(ctx.settings);
+  const now = Date.now();
+  // Held-back photos stay unprocessed; the next run's retry range picks them up.
+  const groups = groupMealPhotos(records, ctx.settings.mealGroupingMinutes).filter((g) => !heldBack(ctx, g, gapMs, now));
+  if (groups.length === 0) return;
+  ctx.result.foodPhotos += groups.reduce((n, g) => n + g.length, 0);
   const library = await loadLibrary();
   let done = 0;
+  /** Settles when group i is finished (estimateGroup never rejects). */
+  const finished: Promise<void>[] = [];
   ctx.progress('estimating_meals', 0, groups.length, `Estimating ${groups.length} meals…`);
   const started = await mapLimit(
     groups,
     AI_CONCURRENCY,
-    async (group) => {
-      await estimateGroup(ctx, group, library);
+    async (group, index) => {
+      // Groups start in order, so every earlier group's promise exists by now.
+      const earlier = finished.slice(0, index);
+      const task = estimateGroup(ctx, group, library, () => Promise.all(earlier));
+      finished[index] = task;
+      await task;
       done++;
       ctx.progress('estimating_meals', done, groups.length, `Estimated ${done} of ${groups.length} meals`);
     },
@@ -631,20 +816,39 @@ export function isProcessing(): boolean {
 // Quick log and hand-picked photos
 // ---------------------------------------------------------------------------
 
-/** Copies the camera file (in the cache, which the OS may purge) into the app's documents. */
-async function storeCapture(uri: string, id: string): Promise<string> {
+/**
+ * Copies a camera / picker file (in the cache, which the OS may purge) into the app's documents
+ * folder `dir`. The absolute URI is stored; scanner.currentAppFileUri finds it again after iOS
+ * moves the app container.
+ */
+async function keepAppCopy(uri: string, dir: string, id: string): Promise<string> {
   try {
-    const dir = new Directory(Paths.document, CAPTURE_DIR);
-    dir.create({ intermediates: true, idempotent: true });
+    const folder = new Directory(Paths.document, dir);
+    folder.create({ intermediates: true, idempotent: true });
     const source = new File(uri);
-    const dest = new File(dir, `${id}${source.extension || '.jpg'}`);
+    const dest = new File(folder, `${id}${source.extension || '.jpg'}`);
     await source.copy(dest);
     return dest.uri;
   } catch (e) {
     // Still process it now; only keeping the image for later review is at risk.
-    log.warn(`could not keep captured photo: ${errorMessage(e)}`);
+    log.warn(`could not keep a copy of the photo: ${errorMessage(e)}`);
     return uri;
   }
+}
+
+async function markProcessedQuietly(assetIds: string[]): Promise<void> {
+  try {
+    await markProcessed(assetIds);
+  } catch (e) {
+    log.warn(`could not mark photos processed: ${errorMessage(e)}`);
+  }
+}
+
+/** A failed meal capture's message, telling the user what to do (unless it already does). */
+function retakeMessage(e: unknown): string {
+  const message = errorMessage(e).trim();
+  if (/retake|take the photo again|type the meal in/i.test(message)) return message;
+  return `${message}${/[.!?]$/.test(message) ? '' : '.'} Nothing was logged — take the photo again or type the meal in.`;
 }
 
 async function captureScale(settings: AppSettings, person: PersonLabel, record: PhotoRecord): Promise<string> {
@@ -662,7 +866,16 @@ async function captureScale(settings: AppSettings, person: PersonLabel, record: 
   return weightEntryId(person, toLocalDate(outcome.candidate.takenAt));
 }
 
+/** The meal the capture ended up in: a meal still in review it belongs to, or a new one. */
 async function captureMeal(settings: AppSettings, person: PersonLabel, record: PhotoRecord): Promise<string> {
+  const job: MealJob = { person, settings };
+  const library = await loadLibrary();
+  // Another shot of a meal still in review (a second angle, the "after" photo) joins that meal.
+  const joined = await addToMealInReview(job, [record], library, mealGapMs(settings), 'either');
+  if (joined) {
+    await markProcessed([record.assetId]);
+    return joined.id;
+  }
   const { images } = await loadMealImages([record]);
   if (images.length === 0) throw new Error(PHOTO_GONE);
   const estimate = await estimateAndReconcile({
@@ -670,16 +883,18 @@ async function captureMeal(settings: AppSettings, person: PersonLabel, record: P
     slot: guessMealSlot(record.creationTime),
     notes: '',
     answers: [],
-    library: await loadLibrary(),
+    library,
     hint: '',
     settings,
   });
-  if (isEmptyEstimate(estimate)) {
-    await markProcessed([record.assetId]);
-    const message = "Couldn't find any food in that photo — retake it or type the meal in.";
-    await setPhotoErrorQuietly(record.assetId, message);
-    throw new Error(message);
+  if (estimate.leftoversOnly) {
+    const after = await addToMealInReview(job, [record], library, LEFTOVERS_ATTACH_MINUTES * 60_000, 'before');
+    if (after) {
+      await markProcessed([record.assetId]);
+      return after.id;
+    }
   }
+  if (isEmptyEstimate(estimate)) throw new Error("Couldn't find any food in that photo — retake it or type the meal in.");
   const meal = newMealEntry(person, [record], estimate, Date.now());
   await upsertMeal(meal);
   await markProcessed([record.assetId]);
@@ -688,7 +903,8 @@ async function captureMeal(settings: AppSettings, person: PersonLabel, record: P
 
 /**
  * Quick-log: a photo just taken in the app with a known category. Stores it
- * (origin 'capture'), reads/estimates immediately, returns the created entry id.
+ * (origin 'capture'), reads/estimates immediately, returns the entry id: the day's weigh-in, or
+ * the meal — a new one, or the meal still in review this photo belongs to (e.g. its "after" photo).
  */
 export async function processCapturedPhoto(
   uri: string,
@@ -699,19 +915,28 @@ export async function processCapturedPhoto(
     const settings = await getSettings();
     const person = requirePerson(settings);
     const id = newId();
-    const storedUri = await storeCapture(uri, id);
+    const storedUri = await keepAppCopy(uri, CAPTURE_DIR, id);
     const record = presetPhotoRecord(
       { assetId: `${CAPTURE_ASSET_PREFIX}${id}`, uri: storedUri, creationTime: takenAt, origin: 'capture' },
       category,
       Date.now(),
     );
-    // Recorded first, so a failure (or the app being killed) leaves it for the next run to retry.
+    // Recorded first, so the app being killed mid-way leaves it for the next run to retry. A scale
+    // photo that fails is retried too (a retake just adds a reading to the same day).
     await insertNewPhotos([record]);
     claim([record]);
     try {
       if (category === 'scale') return { kind: 'weight' as const, id: await captureScale(settings, person, record) };
       return { kind: 'meal' as const, id: await captureMeal(settings, person, record) };
     } catch (e) {
+      if (category === 'food') {
+        // A failed meal capture is not retried by a later run: the user sees the error and takes
+        // the photo again, and a retried first shot would then log the same food a second time.
+        const message = retakeMessage(e);
+        await markProcessedQuietly([record.assetId]);
+        await setPhotoErrorQuietly(record.assetId, message);
+        throw new Error(message);
+      }
       await setPhotoErrorQuietly(record.assetId, errorMessage(e));
       throw e;
     } finally {
@@ -720,15 +945,25 @@ export async function processCapturedPhoto(
   });
 }
 
-/** Photos the user picked, as records with their chosen category (existing rows are re-labelled). */
+/**
+ * Photos the user picked, as records with their chosen category (existing rows are re-labelled).
+ * The picker hands over a copy in the cache, which the OS may purge: a library photo can be read
+ * from the library again later (scanner.resolveReadableUri), but a pick without a library id is
+ * copied into the app's documents first, like a quick-log capture.
+ */
 async function registerPickedPhotos(
   assets: { assetId: string; uri: string; creationTime: number }[],
   category: 'scale' | 'food',
 ): Promise<PhotoRecord[]> {
   const now = Date.now();
   const known = new Map((await getPhotos(assets.map((a) => a.assetId))).map((p) => [p.assetId, p]));
-  const fresh = assets.filter((a) => !known.has(a.assetId));
-  await insertNewPhotos(fresh.map((a) => presetPhotoRecord({ ...a, origin: 'library' }, category, now)));
+  const fresh = await Promise.all(
+    assets
+      .filter((a) => !known.has(a.assetId))
+      .map(async (a) => (isLibraryAssetId(a.assetId) ? a : { ...a, uri: await keepAppCopy(a.uri, PICKED_DIR, newId()) })),
+  );
+  const freshRecords = new Map(fresh.map((a) => [a.assetId, presetPhotoRecord({ ...a, origin: 'library' }, category, now)]));
+  await insertNewPhotos([...freshRecords.values()]);
   const records: PhotoRecord[] = [];
   for (const asset of assets) {
     const existing = known.get(asset.assetId);
@@ -736,7 +971,7 @@ async function registerPickedPhotos(
     records.push(
       existing
         ? { ...existing, uri: asset.uri || existing.uri, category, categoryConfidence: PRESET_CATEGORY_CONFIDENCE }
-        : presetPhotoRecord({ ...asset, origin: 'library' }, category, now),
+        : (freshRecords.get(asset.assetId) as PhotoRecord),
     );
   }
   return records;

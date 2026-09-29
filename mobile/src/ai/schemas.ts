@@ -222,6 +222,9 @@ const QuestionSchema = z.object({
 
 export const FoodSchema = z.object({
   contains_food: z.boolean().describe('False if the photos show no food or drink at all.'),
+  leftovers_only: z
+    .boolean()
+    .describe('True if no photo shows the food before it was eaten: only a partly eaten or empty plate, leftovers or an opened package.'),
   title: z.string().describe('2-6 word meal title, e.g. "Chicken burrito bowl".'),
   method: choice(MODEL_METHODS, 'Main basis of the estimate: the photos, a nutrition label, or a matched usual meal.'),
   items: z.array(FoodItemSchema).describe('Every component eaten, one entry each.'),
@@ -326,6 +329,8 @@ export interface MealContext {
 
 export function toMealEstimate(raw: FoodRaw, ctx: MealContext): MealEstimate {
   const assumptions = cleanList(raw.assumptions);
+  // Only present when true, so estimates that aren't "after" photos look exactly as before.
+  const leftovers = raw.leftovers_only === true ? { leftoversOnly: true } : {};
   if (!raw.contains_food) {
     return {
       title: cleanText(raw.title) || 'No food found',
@@ -343,6 +348,7 @@ export function toMealEstimate(raw: FoodRaw, ctx: MealContext): MealEstimate {
       model: ctx.model,
       samples: 1,
       createdAt: ctx.now,
+      ...leftovers,
     };
   }
   const items = raw.items.map(toFoodItem);
@@ -365,6 +371,7 @@ export function toMealEstimate(raw: FoodRaw, ctx: MealContext): MealEstimate {
     model: ctx.model,
     samples: 1,
     createdAt: ctx.now,
+    ...leftovers,
   };
 }
 

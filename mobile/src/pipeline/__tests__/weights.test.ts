@@ -82,6 +82,15 @@ describe('buildWeightEntries — choosing the official reading', () => {
     expect(e.flags).toEqual(['not_morning']);
   });
 
+  it('treats a reading just after midnight as the evening before, not the morning weigh-in', () => {
+    const [e] = build([cand('late-night', at(28, 0, 40), 187.4), cand('morning', at(28, 7, 30), 185.1)]);
+    expect(e.chosenAssetId).toBe('morning');
+    expect(e.flags).toEqual([]);
+    // Alone, it is used but flagged.
+    const [only] = build([cand('late-night', at(28, 0, 40), 187.4)]);
+    expect(only.flags).toEqual(['not_morning']);
+  });
+
   it('respects the configured morning cutoff', () => {
     const [e] = build([cand('a', at(28, 9, 30), 185)], [], { morningCutoffHour: 9 });
     expect(e.flags).toContain('not_morning');
@@ -202,6 +211,24 @@ describe('buildWeightEntries — existing entries', () => {
     expect(e.notes).toBe('after run');
     expect(e.flags).toEqual(['multiple_readings']);
     expect(e.updatedAt).toBe(NOW);
+  });
+
+  it("keeps the reading the user picked when a later run adds another photo of that day", () => {
+    const picked = entry({
+      candidates: [cand('misread', at(28, 7), 158.1), cand('retake', at(28, 7, 20), 185.1)],
+      chosenAssetId: 'retake',
+      valueLb: 185.1,
+      time: '07:20',
+      chosenByUser: true,
+    });
+    const [e] = build([cand('evening', at(28, 20), 187)], [picked]);
+    expect(e).toMatchObject({ chosenAssetId: 'retake', valueLb: 185.1, time: '07:20', chosenByUser: true });
+    expect(e.candidates.map((c) => c.assetId)).toEqual(['misread', 'retake', 'evening']);
+
+    // Without a hand-picked reading the automatic choice applies.
+    const [auto] = build([cand('evening', at(28, 20), 187)], [{ ...picked, chosenByUser: undefined }]);
+    expect(auto.chosenAssetId).toBe('misread');
+    expect(auto).not.toHaveProperty('chosenByUser');
   });
 
   it('replaces an earlier reading of the same photo', () => {

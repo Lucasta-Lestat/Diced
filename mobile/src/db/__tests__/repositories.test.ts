@@ -22,6 +22,7 @@ import {
   listPendingSheetDeletes,
   listPendingSheetDeletesWithKind,
   markMealsSynced,
+  markMealsSyncError,
   setMealStatus,
   upsertMeal,
 } from '../meals';
@@ -30,6 +31,7 @@ import {
   getPhoto,
   getPhotos,
   insertNewPhotos,
+  listPickedPhotos,
   listUnclassified,
   listUnprocessed,
   markProcessed,
@@ -42,6 +44,7 @@ import {
   getWeightEntry,
   listWeightEntries,
   markWeightsSynced,
+  markWeightsSyncError,
   recentAcceptedWeights,
   setWeightStatus,
   upsertWeightEntry,
@@ -163,6 +166,18 @@ describe('photos', () => {
     expect(await listUnclassified(0, 1000)).toHaveLength(130);
   });
 
+  it('listPickedPhotos: only picked:<name> ids, capture time within [start, end]', async () => {
+    await insertNewPhotos([
+      photo('picked:IMG_1.jpg', 10),
+      photo('picked:IMG_2.jpg', 20),
+      photo('picked:late.jpg', 31),
+      photo('content://media/1', 15),
+      photo('capture:abc', 16),
+      photo('xpicked:odd', 17),
+    ]);
+    expect((await listPickedPhotos(10, 30)).map((p) => p.assetId)).toEqual(['picked:IMG_1.jpg', 'picked:IMG_2.jpg']);
+  });
+
   it('getPhotos keeps the requested order and skips unknown ids', async () => {
     await insertNewPhotos([photo('a', 1), photo('b', 2), photo('c', 3)]);
     const got = await getPhotos(['c', 'nope', 'a']);
@@ -271,6 +286,21 @@ describe('weights', () => {
     expect(await listWeightEntries({ statuses: ['approved'] })).toHaveLength(1);
   });
 
+  it('markWeightsSyncError leaves entries changed since they were read (e.g. rejected mid-sync)', async () => {
+    await upsertWeightEntry(weight('Her', '2026-09-28', { status: 'approved', updatedAt: 5 }));
+    await upsertWeightEntry(weight('Her', '2026-09-29', { status: 'rejected', updatedAt: 9 }));
+    const marked = await markWeightsSyncError(
+      [
+        { id: 'w:Her:2026-09-28', updatedAt: 5 },
+        { id: 'w:Her:2026-09-29', updatedAt: 8 },
+      ],
+      'The sheet is busy',
+    );
+    expect(marked).toBe(1);
+    expect(await getWeightEntry('w:Her:2026-09-28')).toMatchObject({ status: 'sync_error', syncError: 'The sheet is busy', updatedAt: NOW });
+    expect(await getWeightEntry('w:Her:2026-09-29')).toMatchObject({ status: 'rejected', updatedAt: 9 });
+  });
+
   it('markWeightsSynced skips entries edited since they were read', async () => {
     await upsertWeightEntry(weight('Her', '2026-09-28', { status: 'sync_error', syncError: 'x', updatedAt: 5 }));
     await upsertWeightEntry(weight('Her', '2026-09-29', { status: 'approved', updatedAt: 9 }));
@@ -298,7 +328,8 @@ describe('meals', () => {
   it('setMealStatus / markMealsSynced / deleteMeal', async () => {
     await upsertMeal(meal('m1', '2026-09-28', '12:00', { status: 'approved', updatedAt: 7 }));
     expect(await markMealsSynced([{ id: 'm1', updatedAt: 7 }])).toBe(1);
-    expect(await getMeal('m1')).toMatchObject({ status: 'synced', error: null, updatedAt: 7 });
+    // inSheet outlives a later re-estimate, so a reject still deletes the row.
+    expect(await getMeal('m1')).toMatchObject({ status: 'synced', error: null, updatedAt: 7, inSheet: true });
 
     await setMealStatus('m1', 'sync_error', 'bad row');
     expect(await getMeal('m1')).toMatchObject({ status: 'sync_error', error: 'bad row', updatedAt: NOW });
@@ -306,6 +337,23 @@ describe('meals', () => {
 
     await deleteMeal('m1');
     expect(await getMeal('m1')).toBeNull();
+  });
+
+  it('markMealsSyncError leaves a meal rejected while the request was in flight', async () => {
+    await upsertMeal(meal('m1', '2026-09-28', '12:00', { status: 'approved', updatedAt: 7 }));
+    await upsertMeal(meal('m2', '2026-09-28', '13:00', { status: 'rejected', updatedAt: 11 }));
+    expect(
+      await markMealsSyncError(
+        [
+          { id: 'm1', updatedAt: 7 },
+          { id: 'm2', updatedAt: 10 },
+        ],
+        'Timed out',
+      ),
+    ).toBe(1);
+    expect(await getMeal('m1')).toMatchObject({ status: 'sync_error', error: 'Timed out', updatedAt: NOW });
+    expect(await getMeal('m2')).toMatchObject({ status: 'rejected', updatedAt: 11 });
+    expect((await listMeals({ statuses: ['sync_error'] })).map((m) => m.id)).toEqual(['m1']);
   });
 
   it('queues sheet deletes with an inferred kind', async () => {
@@ -339,9 +387,19 @@ describe('library', () => {
       libItem('new', { synced: false }),
     ];
     const plan = planLibraryMerge(local, sheet);
-    expect(plan.upsert.map((i) => i.id)).toEqual(['sheet-newer', 'synced', 'new']);
-    expect(plan.upsert.every((i) => i.synced)).toBe(true);
+    expect(plan.upsert.map((i) => i.id)).toEqual(['keep-local', 'sheet-newer', 'synced', 'new']);
+    // The newer local edit is kept, but the use count is the sheet's (both phones add to it).
+    expect(plan.upsert[0]).toMatchObject({ id: 'keep-local', synced: false, updatedAt: 50, uses: 1 });
+    expect(plan.upsert.slice(1).every((i) => i.synced)).toBe(true);
     expect(plan.remove).toEqual(['orphan-synced']);
+  });
+
+  it("planLibraryMerge: a stale copy with only new uses takes the sheet's content and keeps the uses pending", () => {
+    // Him changed the calories; Her's phone only counted a use on its old copy.
+    const local = [libItem('oats', { synced: true, updatedAt: 10, uses: 3, pendingUses: 1, macros: { kcal: 350, proteinG: 1, carbsG: 1, fatG: 1 } })];
+    const sheet = [libItem('oats', { updatedAt: 20, uses: 5, macros: { kcal: 420, proteinG: 1, carbsG: 1, fatG: 1 } })];
+    const [merged] = planLibraryMerge(local, sheet).upsert;
+    expect(merged).toMatchObject({ synced: true, updatedAt: 20, uses: 5, pendingUses: 1, macros: { kcal: 420 } });
   });
 
   it('merges, tracks unsynced items and increments uses', async () => {
@@ -357,11 +415,26 @@ describe('library', () => {
     expect(await listUnsyncedLibrary()).toEqual([]);
     expect((await getLibraryItem('b'))?.synced).toBe(true);
 
+    const before = await getLibraryItem('c');
     await incrementLibraryUse('c');
-    expect(await getLibraryItem('c')).toMatchObject({ uses: 2, synced: false, updatedAt: NOW });
-    expect(await markLibraryItemsSynced([{ id: 'c', updatedAt: 1000 }])).toBe(0);
-    expect(await markLibraryItemsSynced([{ id: 'c', updatedAt: NOW }])).toBe(1);
-    expect((await getLibraryItem('c'))?.synced).toBe(true);
+    // A use is pending on top of the sheet's count; content and updatedAt are untouched.
+    expect(await getLibraryItem('c')).toMatchObject({ uses: before?.uses, pendingUses: 1, synced: true, updatedAt: before?.updatedAt });
+    expect((await listUnsyncedLibrary()).map((i) => i.id)).toEqual(['c']);
+    await incrementLibraryUse('c');
+
+    // Two uses were pushed; one more is counted while the request is in flight.
+    const pushed = (await getLibraryItem('c'))!;
+    await incrementLibraryUse('c');
+    expect(await markLibraryItemsSynced([{ id: 'c', updatedAt: pushed.updatedAt, pendingUses: 2 }])).toBe(1);
+    expect(await getLibraryItem('c')).toMatchObject({ uses: (before?.uses ?? 0) + 2, pendingUses: 1, synced: true });
+    expect(await markLibraryItemsSynced([{ id: 'c', updatedAt: pushed.updatedAt, pendingUses: 1 }])).toBe(1);
+    expect(await getLibraryItem('c')).not.toHaveProperty('pendingUses');
+    expect(await listUnsyncedLibrary()).toEqual([]);
+
+    // Content edited since it was read: uses still fold in, but it stays unsynced.
+    await upsertLibraryItem({ ...(await getLibraryItem('b'))!, synced: false, updatedAt: 70, pendingUses: 1 });
+    expect(await markLibraryItemsSynced([{ id: 'b', updatedAt: 60, pendingUses: 1 }])).toBe(0);
+    expect(await getLibraryItem('b')).toMatchObject({ synced: false, uses: 2 });
   });
 });
 

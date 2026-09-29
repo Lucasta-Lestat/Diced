@@ -1,13 +1,13 @@
 import { Stack, useRouter } from 'expo-router';
 import { useEffect, useRef, useState } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { AppState, StyleSheet, Text, View } from 'react-native';
 import { getSettings } from '../config/settings';
 import { listMeals } from '../db/meals';
 import { lastRuns, type RunRecord } from '../db/runs';
 import { listWeightEntries } from '../db/weights';
 import { mondayOf, toLocalDate, addDays } from '../lib/dates';
 import { errorMessage } from '../lib/log';
-import { getPhotoPermission, type PhotoPermission } from '../photos/scanner';
+import { getPhotoPermission, requestPhotoPermission, type PhotoPermission } from '../photos/scanner';
 import type { SheetSummaryWeek } from '../sync/contract';
 import { getSheetInfo } from '../sync/sheetsClient';
 import { getCachedSummary, getLastSync, refreshSummary, type LastSync } from '../sync/syncQueue';
@@ -23,16 +23,19 @@ import {
   Screen,
   Stat,
   useAutoRunState,
+  useOnSyncDone,
   VStack,
 } from '../ui/components';
 import { formatKcal, formatWeight, formatWeightDelta, plural, relativeTime, runSummary, syncSummary, weekdayShort } from '../ui/format';
 import { useAsync, useFocusRefresh, useNow } from '../ui/hooks';
-import { averageLb, dayKcal, isCounted, weekWeighIns, type WeekDay } from '../ui/reviewModel';
+import { averageLb, dayKcal, isCounted, summaryNeedsRefresh, weekWeighIns, type WeekDay } from '../ui/reviewModel';
 import { colors, radius, spacing, type } from '../ui/theme';
 import { openSystemSettings } from '../ui/system';
 
-/** Re-fetch the sheet summary on open when the cached one is older than this. */
+/** Re-fetch the sheet summary when the cached one is older than this (or from an earlier week). */
 const SUMMARY_STALE_MS = 60 * 60_000;
+/** After a failed automatic fetch, wait this long before trying again on its own. */
+const SUMMARY_RETRY_MS = 5 * 60_000;
 
 interface HomeData {
   settings: AppSettings;
@@ -114,10 +117,19 @@ export default function Home() {
   const [summaryError, setSummaryError] = useState<string | null>(null);
   const reloadHome = home.reload;
   useFocusRefresh(reloadHome);
+  // Approve / reject sync a few seconds later: show the result (waiting count, sync errors).
+  useOnSyncDone(reloadHome);
   const autoPhase = useAutoRunState().phase;
   useEffect(() => {
     if (autoPhase === 'done') void reloadHome();
   }, [autoPhase, reloadHome]);
+  // Home is the root screen and stays mounted for the life of the app: re-check on resume too.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next === 'active') void reloadHome();
+    });
+    return () => sub.remove();
+  }, [reloadHome]);
 
   const fetchSummary = async () => setSummaryError(await summaryRefreshError());
 
@@ -128,18 +140,36 @@ export default function Home() {
     setRefreshing(false);
   };
 
-  const autoFetched = useRef(false);
+  // Every reload (focus, resume, run done, sync) checks whether the sheet numbers are stale: older
+  // than an hour, from an earlier plan week, or fetched for a sheet this phone no longer uses.
+  const summaryCheck = useRef<{ url: string | null | undefined; attemptAt: number; inFlight: boolean }>({
+    url: undefined,
+    attemptAt: 0,
+    inFlight: false,
+  });
   const data = home.data;
   useEffect(() => {
-    if (!data || autoFetched.current) return;
-    autoFetched.current = true;
-    const stale = data.summaryFetchedAt === null || Date.now() - data.summaryFetchedAt > SUMMARY_STALE_MS;
-    if (stale && data.settings.person && data.settings.sheetWebAppUrl) {
-      void summaryRefreshError().then((message) => {
-        setSummaryError(message);
-        return reloadHome();
-      });
+    if (!data) return;
+    const check = summaryCheck.current;
+    const url = data.settings.sheetWebAppUrl;
+    if (!data.settings.person || !url) {
+      check.url = url;
+      return;
     }
+    // Leave check.url alone meanwhile, so a sheet change is still noticed on the reload after it.
+    if (check.inFlight) return;
+    const sheetChanged = check.url !== undefined && check.url !== url;
+    check.url = url;
+    const now = Date.now();
+    const due = sheetChanged || (summaryNeedsRefresh(data.summaryFetchedAt, now, SUMMARY_STALE_MS) && now - check.attemptAt >= SUMMARY_RETRY_MS);
+    if (!due) return;
+    check.inFlight = true;
+    check.attemptAt = now;
+    void summaryRefreshError().then((message) => {
+      check.inFlight = false;
+      setSummaryError(message);
+      return reloadHome();
+    });
   }, [data, reloadHome]);
 
   return (
@@ -150,13 +180,20 @@ export default function Home() {
         }}
       />
       <ErrorBanner message={home.error} onRetry={() => void home.reload()} />
-      {data ? <HomeBody data={data} summaryError={summaryError} /> : null}
+      {data ? <HomeBody data={data} summaryError={summaryError} onReload={() => void reloadHome()} /> : null}
     </Screen>
   );
 }
 
-function HomeBody({ data, summaryError }: { data: HomeData; summaryError: string | null }) {
+function HomeBody({ data, summaryError, onReload }: { data: HomeData; summaryError: string | null; onReload: () => void }) {
   const router = useRouter();
+  const [photoAskError, setPhotoAskError] = useState<string | null>(null);
+  // Never asked (e.g. "Not now" during setup): iOS only lists Photos in the app's Settings page
+  // after the app has asked, so ask here instead of sending the user there.
+  const allowPhotos = () => {
+    setPhotoAskError(null);
+    requestPhotoPermission().then(onReload, (e: unknown) => setPhotoAskError(errorMessage(e)));
+  };
   const now = useNow();
   const unit = data.settings.scaleUnit;
   const connected = Boolean(data.settings.sheetWebAppUrl && data.settings.person);
@@ -174,7 +211,15 @@ function HomeBody({ data, summaryError }: { data: HomeData; summaryError: string
       {!connected ? (
         <Notice tone="warning" message="Connect the Google Sheet so approved entries can be saved." actionLabel="Connect" onAction={() => router.push('/connect')} />
       ) : null}
-      {data.photoPermission && data.photoPermission !== 'granted_all' ? (
+      {data.photoPermission === 'undetermined' ? (
+        <Notice
+          tone="warning"
+          title="Photo access not set up"
+          message="Diced can only find new scale and food photos with access to all photos."
+          actionLabel="Allow photo access"
+          onAction={allowPhotos}
+        />
+      ) : data.photoPermission && data.photoPermission !== 'granted_all' ? (
         <Notice
           tone="warning"
           title={data.photoPermission === 'granted_limited' ? 'Limited photo access' : 'No photo access'}
@@ -183,6 +228,7 @@ function HomeBody({ data, summaryError }: { data: HomeData; summaryError: string
           onAction={openSystemSettings}
         />
       ) : null}
+      <ErrorBanner message={photoAskError} />
       {data.syncErrors > 0 ? (
         <Notice tone="danger" message={`${plural(data.syncErrors, 'entry', 'entries')} couldn't be written to the sheet.`} actionLabel="Review" onAction={() => router.push('/review')} />
       ) : null}

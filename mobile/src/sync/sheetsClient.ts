@@ -7,6 +7,7 @@ import { getSecret, getSettings } from '../config/settings';
 import { kvGet, kvSet } from '../db/database';
 import { errorMessage } from '../lib/log';
 import type { ActionMap, ActionName, ErrorCode, PingData, RequestBody } from './contract';
+import { isAppsScriptExecUrl } from './webAppUrl';
 
 export class SheetsApiError extends Error {
   constructor(
@@ -122,10 +123,24 @@ function htmlError(status: number, html: string): SheetsApiError {
   return new SheetsApiError(`The sheet returned a web page instead of data${page}. ${hint}`, 'bad_response');
 }
 
+/**
+ * The token and entries only ever go to a script.google.com web-app `/exec` URL (the same rule as
+ * the sheet's own dialog, apps-script/Code.gs DICED_EXEC_URL_RE), whatever a link or paste says.
+ */
 function checkUrl(url: string): string {
   const trimmed = url.trim();
   if (!/^https:\/\/\S+$/i.test(trimmed)) {
     throw new SheetsApiError('The sheet URL must start with https:// (the Apps Script /exec URL).', 'not_configured');
+  }
+  if (!isAppsScriptExecUrl(trimmed)) {
+    const dev = /^https:\/\/script\.google\.com\/\S*\/dev\/?$/i.test(trimmed);
+    throw new SheetsApiError(
+      dev
+        ? 'This is the /dev test URL. Use the web-app URL ending in /exec (Diced → Show app connection info).'
+        : 'Diced only connects to a Google Apps Script web-app URL: https://script.google.com/…/exec, ' +
+            'exactly as Diced → Show app connection info in your sheet shows it.',
+      'not_configured',
+    );
   }
   return trimmed;
 }

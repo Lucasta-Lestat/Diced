@@ -1,9 +1,10 @@
 /** Shared React hooks for screens. */
-import { useFocusEffect } from 'expo-router';
+import { useFocusEffect, useIsFocused } from 'expo-router';
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { getSettings, subscribeSettings } from '../config/settings';
 import { getPhotos } from '../db/photos';
 import { errorMessage } from '../lib/log';
+import { displayUriFor } from '../photos/scanner';
 import { createActionRunner } from './actionRunner';
 import type { AppSettings } from '../types';
 
@@ -19,8 +20,26 @@ export function useMounted(): { readonly current: boolean } {
   return mounted;
 }
 
+/**
+ * For navigating after a slow await (an estimate, a merge): true only while the calling screen is
+ * still mounted and focused. The router acts on whatever screen is on top, so navigating after the
+ * user has left would replace a screen they never meant to leave.
+ */
+export function useStillHere(): () => boolean {
+  const focused = useIsFocused();
+  const here = useRef(false);
+  useLayoutEffect(() => {
+    here.current = focused;
+    // Unmounting (or losing focus) counts as gone.
+    return () => {
+      here.current = false;
+    };
+  }, [focused]);
+  return useCallback(() => here.current, []);
+}
+
 /** Keeps the latest value in a ref without re-running effects that read it. */
-function useLatest<T>(value: T): { readonly current: T } {
+export function useLatest<T>(value: T): { readonly current: T } {
   const ref = useRef(value);
   useLayoutEffect(() => {
     ref.current = value;
@@ -212,10 +231,14 @@ export function useAction<A extends unknown[], R>(fn: (...args: A) => Promise<R>
   return { run, pending, error, setError };
 }
 
-/** assetId → displayable URI for the photos the pipeline knows about. */
+/**
+ * assetId → displayable URI for the photos the pipeline knows about. Uses displayUriFor so a
+ * hand-picked photo whose cache copy was purged falls back to its library asset, and a capture
+ * is found again after iOS moves the app container on an update.
+ */
 export async function loadPhotoUris(assetIds: string[]): Promise<Record<string, string>> {
   const unique = [...new Set(assetIds)];
   if (unique.length === 0) return {};
   const records = await getPhotos(unique);
-  return Object.fromEntries(records.map((r) => [r.assetId, r.uri]));
+  return Object.fromEntries(records.map((r) => [r.assetId, displayUriFor(r)]));
 }

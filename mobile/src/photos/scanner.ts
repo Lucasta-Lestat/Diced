@@ -4,8 +4,9 @@
  * Uses the SDK 57 object API (`Query`, `Asset`); the old function API (getAssetsAsync,
  * getAssetInfoAsync) throws at runtime from the package root.
  */
-import { File } from 'expo-file-system';
+import { File, Paths } from 'expo-file-system';
 import {
+  Album,
   Asset,
   AssetField,
   getPermissionsAsync,
@@ -17,6 +18,7 @@ import {
 import { Platform } from 'react-native';
 import { logger } from '../lib/log';
 import type { PhotoAsset } from '../types';
+import { appFileParts, isLibraryAssetId } from './appFiles';
 import { isMissingAssetError, normalizeRange, toPhotoAsset, toPhotoPermission } from './assetMapping';
 
 export type PhotoPermission = 'granted_all' | 'granted_limited' | 'denied' | 'undetermined';
@@ -27,6 +29,24 @@ const PAGE_SIZE = 500;
 const SUBTYPE_CONCURRENCY = 8;
 /** Android 11 (API 30) is the first release where media file paths are readable directly. */
 const ANDROID_FILE_PATH_MIN_API = 30;
+
+/**
+ * Albums messaging apps save received images into (iOS albums / Android folders). On iOS these
+ * images get ordinary IMG_1234 file names, so the album is the only on-device signal.
+ */
+export const MESSAGING_ALBUMS = [
+  'WhatsApp',
+  'WhatsApp Images',
+  'WhatsApp Business',
+  'WhatsApp Business Images',
+  'Signal',
+  'Telegram',
+  'Telegram Images',
+  'Messenger',
+  'Viber',
+  'Viber Images',
+  'WeChat',
+] as const;
 
 const log = logger('photos');
 
@@ -57,13 +77,32 @@ function pageQuery(startMs: number, endMs: number, offset: number): Query {
     .offset(offset);
 }
 
-async function queryAllMetadata(startMs: number, endMs: number): Promise<AssetMetadata[]> {
+async function queryAllMetadata(startMs: number, endMs: number, album?: Album): Promise<AssetMetadata[]> {
   const all: AssetMetadata[] = [];
   for (let offset = 0; ; offset += PAGE_SIZE) {
-    const page = await pageQuery(startMs, endMs, offset).exeForMetadata();
+    const query = pageQuery(startMs, endMs, offset);
+    const page = await (album ? query.album(album) : query).exeForMetadata();
     all.push(...page);
     if (page.length < PAGE_SIZE) return all;
   }
+}
+
+/**
+ * Ids of photos in [startMs, endMs) that sit in a messaging app's album. Best-effort: a failed
+ * lookup just means "none found" (the file-name check still applies).
+ */
+async function messagingAlbumAssetIds(startMs: number, endMs: number): Promise<Set<string>> {
+  const ids = new Set<string>();
+  for (const title of MESSAGING_ALBUMS) {
+    try {
+      const album = await Album.get(title);
+      if (!album) continue;
+      for (const m of await queryAllMetadata(startMs, endMs, album)) ids.add(m.id);
+    } catch (e) {
+      log.debug(`album "${title}" unavailable`, e);
+    }
+  }
+  return ids;
 }
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
@@ -95,9 +134,11 @@ export async function listPhotosInRange(startMs: number, endMs: number): Promise
   if (!(endMs > startMs)) return [];
   const metadata = await queryAllMetadata(startMs, endMs);
   const images = metadata.filter((m) => m.mediaType === MediaType.IMAGE && m.creationTime !== null);
-  const assets = await mapLimit(images, SUBTYPE_CONCURRENCY, async (m) =>
-    toPhotoAsset(m, await mediaSubtypesOf(m.id)),
-  );
+  const messaging = images.length > 0 ? await messagingAlbumAssetIds(startMs, endMs) : new Set<string>();
+  const assets = await mapLimit(images, SUBTYPE_CONCURRENCY, async (m) => {
+    const asset = toPhotoAsset(m, await mediaSubtypesOf(m.id));
+    return messaging.has(m.id) ? { ...asset, fromMessagingAlbum: true } : asset;
+  });
   return normalizeRange(assets, startMs, endMs);
 }
 
@@ -122,12 +163,36 @@ function readableUriFor(assetId: string, resolved: string): string {
 }
 
 /**
- * A `file://` URI readable by expo-image-manipulator for the asset (resolves `ph://`
- * on iOS via getAssetInfoAsync localUri). Returns null if the asset no longer exists.
+ * The stored `file://` URI of a photo the app keeps itself, as it is now, or null when the file
+ * is gone. iOS moves the app's data container on app updates and reinstalls, so an absolute
+ * `…/Application/<old id>/Documents/captures/x.jpg` is looked up again in today's documents folder.
+ */
+export function currentAppFileUri(uri: string): string | null {
+  if (localFileExists(uri)) return uri;
+  const parts = appFileParts(uri);
+  if (!parts) return null;
+  try {
+    const moved = new File(Paths.document, parts.dir, parts.name).uri;
+    return moved !== uri && localFileExists(moved) ? moved : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * A `file://` URI readable by expo-image-manipulator for the asset (resolves `ph://` on iOS to the
+ * original, downloading it from iCloud if needed). Returns null if the photo no longer exists.
+ * A stored file copy (quick-log capture, or the picker's copy of a hand-picked photo) is used while
+ * it exists; the picker's copy lives in the cache, which the OS may purge, so a hand-picked
+ * library photo then falls back to the library asset itself.
  */
 export async function resolveReadableUri(assetId: string, fallbackUri: string): Promise<string | null> {
-  // Quick-log captures live in the app's own storage, not in the media library.
-  if (fallbackUri.startsWith('file://')) return localFileExists(fallbackUri) ? fallbackUri : null;
+  if (fallbackUri.startsWith('file://')) {
+    const local = currentAppFileUri(fallbackUri);
+    if (local) return local;
+    // Captures and picks without a library id live only in app storage.
+    if (!isLibraryAssetId(assetId)) return null;
+  }
 
   try {
     return readableUriFor(assetId, await new Asset(assetId).getUri());
@@ -135,4 +200,16 @@ export async function resolveReadableUri(assetId: string, fallbackUri: string): 
     if (isMissingAssetError(e)) return null;
     throw e;
   }
+}
+
+/**
+ * Synchronous: a URI expo-image can display for a stored photo (thumbnails), with the same
+ * fallbacks as resolveReadableUri — the relocated app file, else the library asset id (expo-image
+ * loads `ph://` and `content://` directly). Returns the stored URI when nothing better exists.
+ */
+export function displayUriFor(photo: { assetId: string; uri: string }): string {
+  if (!photo.uri.startsWith('file://')) return photo.uri;
+  const local = currentAppFileUri(photo.uri);
+  if (local) return local;
+  return isLibraryAssetId(photo.assetId) ? photo.assetId : photo.uri;
 }

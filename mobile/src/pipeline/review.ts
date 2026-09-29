@@ -11,6 +11,7 @@ import { newId, weightEntryId } from '../lib/ids';
 import { errorMessage, logger } from '../lib/log';
 import { rescaleRange, sumMacros } from '../nutrition/reconcile';
 import type {
+  ClarifyingQuestion,
   Confidence,
   EntryStatus,
   FoodItem,
@@ -25,6 +26,14 @@ import type {
 import { withWeightLock } from './concurrency';
 import { isConfidentMeal, isConfidentWeight, MAX_MACRO_G, MAX_MEAL_KCAL } from './confidence';
 import { estimateAndReconcile, loadMealImages } from './mealEstimate';
+import {
+  answeredQuestions,
+  answersFor,
+  freeQuestionId,
+  mealMayBeInSheet,
+  questionKey,
+  withNewEstimate,
+} from './mealRevision';
 import { assessReading, isPlausibleLb, MAX_PLAUSIBLE_LB, MIN_PLAUSIBLE_LB, sourceForAsset } from './weights';
 
 /** Pure approve-all rules (shared with the Review screen's count). */
@@ -85,12 +94,22 @@ export async function approveWeight(id: string, valueLb?: number, notes?: string
   });
 }
 
-/** Choose a different candidate reading for the day. */
+/**
+ * Choose a different candidate reading for the day. The choice is remembered (`chosenByUser`), so
+ * a later run that reads another photo of that day doesn't switch back to its automatic pick.
+ */
 export async function chooseWeightCandidate(id: string, assetId: string): Promise<WeightEntry> {
   return withWeightLock(async () => {
     const entry = await requireWeight(id);
     const chosen = entry.candidates.find((c) => c.assetId === assetId);
     if (!chosen) throw new Error("That photo isn't one of this day's readings.");
+    // An accepted day goes straight back to the sheet, which rejects values outside its bounds
+    // (and would fail the whole sync batch with it); a day still in review is checked on approve.
+    if (IN_SHEET.includes(entry.status) && !isPlausibleLb(chosen.valueLb)) {
+      throw new Error(
+        `That reading (${round1(chosen.valueLb)} lb) is outside ${MIN_PLAUSIBLE_LB}–${MAX_PLAUSIBLE_LB} lb — type the weight instead.`,
+      );
+    }
     const settings = await getSettings();
     const recent = await recentAcceptedWeights(entry.person, entry.localDate, RECENT_WEIGHT_DAYS);
     const history = recent.flatMap((e) => (e.valueLb === null ? [] : [{ localDate: e.localDate, valueLb: e.valueLb }]));
@@ -108,6 +127,7 @@ export async function chooseWeightCandidate(id: string, assetId: string): Promis
       confidence,
       status: statusAfterEdit(entry.status),
       updatedAt: Date.now(),
+      chosenByUser: true,
     };
     await upsertWeightEntry(updated);
     return updated;
@@ -231,7 +251,8 @@ export async function editMeal(id: string, edit: MealEdit): Promise<MealEntry> {
   if (edit.itemGrams && Object.keys(edit.itemGrams).length > 0) {
     if (!estimate) throw new Error('This meal has no items to edit.');
     estimate = applyItemGrams(estimate, edit.itemGrams);
-    final = { ...estimate.totals };
+    // Same bounds as typed totals: a grams typo (1400 g of oil) must not reach the sheet.
+    final = checkedMacros(estimate.totals);
   }
   if (edit.final) final = checkedMacros(edit.final);
   const updated: MealEntry = {
@@ -248,22 +269,6 @@ export async function editMeal(id: string, edit: MealEdit): Promise<MealEntry> {
   };
   await upsertMeal(updated);
   return updated;
-}
-
-function answeredQuestions(meal: MealEntry): { question: string; answer: string }[] {
-  return (meal.estimate?.questions ?? []).flatMap((q) => {
-    const answer = meal.answers[q.id]?.trim();
-    return answer ? [{ question: q.question, answer }] : [];
-  });
-}
-
-/** Answered questions stay listed (with their answers) next to the new estimate's questions. */
-function carryAnsweredQuestions(meal: MealEntry, next: MealEstimate): MealEstimate {
-  const answered = (meal.estimate?.questions ?? []).filter((q) => meal.answers[q.id]?.trim());
-  const answeredText = new Set(answered.map((q) => q.question.trim().toLowerCase()));
-  const answeredIds = new Set(answered.map((q) => q.id));
-  const fresh = next.questions.filter((q) => !answeredIds.has(q.id) && !answeredText.has(q.question.trim().toLowerCase()));
-  return { ...next, questions: [...answered, ...fresh] };
 }
 
 async function loadLibraryQuietly(): Promise<LibraryItem[]> {
@@ -291,22 +296,38 @@ async function reestimated(meal: MealEntry): Promise<MealEntry> {
     hint: `${meal.title} ${meal.notes}`,
     settings,
   });
-  // Keep a title the user typed; otherwise take the model's new one.
-  const titleEdited = meal.estimate !== null && meal.title !== meal.estimate.title;
-  return {
-    ...meal,
-    estimate: carryAnsweredQuestions(meal, estimate),
-    final: { ...estimate.totals },
-    title: titleEdited ? meal.title : estimate.title,
-    status: 'needs_review',
-    error: null,
-    updatedAt: Date.now(),
-  };
+  return withNewEstimate(meal, estimate, Date.now());
 }
 
-/** Re-run estimation with current notes + answers (+ reconcile). Keeps status needs_review. */
+/** Throws unless every meal is still stored exactly as it was read (same updatedAt). */
+/**
+ * A meal was approved, edited, merged or deleted while a slow model call (re-estimate / merge)
+ * ran, so the result was not saved. The screen should reload the meal and let the user retry.
+ */
+export class MealChangedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'MealChangedError';
+  }
+}
+
+async function requireUnchanged(meals: MealEntry[], message: string): Promise<void> {
+  for (const meal of meals) {
+    const current = await getMeal(meal.id);
+    if (!current || current.updatedAt !== meal.updatedAt) throw new MealChangedError(message);
+  }
+}
+
+/**
+ * Re-run estimation with current notes + answers (+ reconcile). The meal goes back to
+ * needs_review (a meal already in the sheet stays marked `inSheet`, so rejecting it later still
+ * deletes its row). The model call can take a while: if the meal was approved or edited in the
+ * meantime, nothing is saved and this throws.
+ */
 export async function reestimateMeal(id: string): Promise<MealEntry> {
-  const updated = await reestimated(await requireMeal(id));
+  const meal = await requireMeal(id);
+  const updated = await reestimated(meal);
+  await requireUnchanged([meal], 'This meal changed while it was being re-estimated — check it and try again.');
   await upsertMeal(updated);
   return updated;
 }
@@ -333,10 +354,13 @@ export async function approveMeal(id: string): Promise<MealEntry> {
   return approve(await requireMeal(id));
 }
 
-/** Reject (not food / not mine). If it was synced, queue a sheet delete. */
+/**
+ * Reject (not food / not mine). If its row may be in the sheet — its status says so, or it was
+ * synced before a re-estimate / merge put it back in review — queue a sheet delete.
+ */
 export async function rejectMeal(id: string): Promise<void> {
   const meal = await requireMeal(id);
-  if (IN_SHEET.includes(meal.status)) await addPendingSheetDelete(meal.id, 'meal');
+  if (meal.status !== 'rejected' && mealMayBeInSheet(meal)) await addPendingSheetDelete(meal.id, 'meal');
   await upsertMeal({ ...meal, status: 'rejected', error: null, updatedAt: Date.now() });
 }
 
@@ -361,6 +385,36 @@ function manualItem(meal: MealEntry): FoodItem {
   };
 }
 
+/**
+ * Pure: both meals' clarifying questions and answers in one list. Every estimate numbers its
+ * questions from q1, so b's questions that collide with a's ids (or a's answer keys) get free ids
+ * and b's answers move with them — otherwise a's answer would be taken as the answer to b's
+ * different question. A question both meals ask is listed once (with whichever answer exists).
+ */
+export function combineQuestions(a: MealEntry, b: MealEntry): { questions: ClarifyingQuestion[]; answers: Record<string, string> } {
+  const aQuestions = a.estimate?.questions ?? [];
+  const questions = [...aQuestions];
+  const answers = answersFor(aQuestions, a.answers);
+  const byText = new Map(aQuestions.map((q) => [questionKey(q.question), q]));
+  const taken = new Set([...aQuestions.map((q) => q.id), ...Object.keys(a.answers)]);
+  for (const q of b.estimate?.questions ?? []) {
+    const answer = b.answers[q.id]?.trim();
+    const key = questionKey(q.question);
+    const same = byText.get(key);
+    if (same) {
+      if (answer && !answers[same.id]?.trim()) answers[same.id] = answer;
+      continue;
+    }
+    const id = taken.has(q.id) ? freeQuestionId(taken) : q.id;
+    taken.add(id);
+    const moved = id === q.id ? q : { ...q, id };
+    questions.push(moved);
+    byText.set(key, moved);
+    if (answer) answers[id] = answer;
+  }
+  return { questions, answers };
+}
+
 /** Pure: both meals' items in one estimate (used until / unless re-estimation succeeds). */
 export function combineMeals(a: MealEntry, b: MealEntry, title: string, now: number): MealEstimate {
   const items = [...(a.estimate?.items ?? [manualItem(a)]), ...(b.estimate?.items ?? [manualItem(b)])];
@@ -378,7 +432,7 @@ export function combineMeals(a: MealEntry, b: MealEntry, title: string, now: num
     kcalHigh: range(a).high + range(b).high,
     confidence: confidences.reduce((x, y) => (CONFIDENCE_RANK[x] <= CONFIDENCE_RANK[y] ? x : y)),
     method: a.estimate?.method === b.estimate?.method && a.estimate ? a.estimate.method : 'photo',
-    questions: [...(a.estimate?.questions ?? []), ...(b.estimate?.questions ?? [])],
+    questions: combineQuestions(a, b).questions,
     assumptions: [...new Set([...(a.estimate?.assumptions ?? []), ...(b.estimate?.assumptions ?? [])])],
     libraryItemId: null,
     brand: a.estimate?.brand && a.estimate.brand === b.estimate?.brand ? a.estimate.brand : null,
@@ -393,7 +447,11 @@ function earlier(a: MealEntry, b: MealEntry): MealEntry {
   return `${b.localDate} ${b.time}` < `${a.localDate} ${a.time}` ? b : a;
 }
 
-/** Merge meal `b` into `a` (photos combined, re-estimated). */
+/**
+ * Merge meal `b` into `a` (photos combined, re-estimated). The result is back in review; if `a`
+ * was already in the sheet it stays marked `inSheet`, and `b`'s row is deleted. Nothing is saved
+ * if either meal changed while the merge was re-estimating.
+ */
 export async function mergeMeals(aId: string, bId: string): Promise<MealEntry> {
   if (aId === bId) throw new Error("Can't merge a meal with itself.");
   const a = await requireMeal(aId);
@@ -413,13 +471,14 @@ export async function mergeMeals(aId: string, bId: string): Promise<MealEntry> {
     slot: first.slot,
     assetIds,
     notes: [a.notes.trim(), b.notes.trim()].filter(Boolean).join('\n'),
-    answers: { ...b.answers, ...a.answers },
+    answers: combineQuestions(a, b).answers,
     estimate: combineMeals(a, b, title, now),
     final: addMacros(a.final, b.final),
     title,
     status: 'needs_review',
     error: null,
     updatedAt: now,
+    ...(mealMayBeInSheet(a) ? { inSheet: true } : {}),
   };
   let result = merged;
   try {
@@ -428,8 +487,9 @@ export async function mergeMeals(aId: string, bId: string): Promise<MealEntry> {
     // The merge stands with the two estimates added up; the user can retry re-estimation.
     result = { ...merged, error: errorMessage(e) };
   }
+  await requireUnchanged([a, b], 'These meals changed while they were being merged — check them and try again.');
   await upsertMeal(result);
-  if (IN_SHEET.includes(b.status)) await addPendingSheetDelete(b.id, 'meal');
+  if (mealMayBeInSheet(b)) await addPendingSheetDelete(b.id, 'meal');
   await deleteMeal(b.id);
   return result;
 }
@@ -450,6 +510,8 @@ export async function saveMealToLibrary(id: string, name: string, serving: strin
   );
   // Approving a needs_review meal counts the use later (see approve), so don't count it twice.
   const counted = meal.status !== 'needs_review' && meal.estimate?.libraryItemId !== existing?.id ? 1 : 0;
+  // An existing item's use is added to the sheet's count (pendingUses), not written over it.
+  const pendingUses = (existing?.pendingUses ?? 0) + (existing ? counted : 0);
   const now = Date.now();
   const item: LibraryItem = {
     id: existing?.id ?? newId(),
@@ -458,9 +520,10 @@ export async function saveMealToLibrary(id: string, name: string, serving: strin
     macros,
     aliases,
     addedBy: existing?.addedBy ?? meal.person,
-    uses: (existing?.uses ?? 0) + counted,
+    uses: existing ? existing.uses : counted,
     updatedAt: now,
     synced: false,
+    ...(pendingUses > 0 ? { pendingUses } : {}),
   };
   await upsertLibraryItem(item);
   if (meal.estimate) {
