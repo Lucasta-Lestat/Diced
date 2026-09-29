@@ -46,9 +46,10 @@ add a payment method. Each phone stores the key in its secure storage, and the k
 is only sent to Anthropic's API.
 
 **Rough cost** at Claude Opus 5.5 pricing ($4 / $20 per million input/output tokens):
-about **$2 per person per week** with ~3 photographed meals a day and a daily
-weigh-in. "Thorough" accuracy mode roughly doubles the meal part. Sorting the week's
-photos adds a few cents.
+roughly **$2–3 per person per week** with ~3 photographed meals a day and a daily
+weigh-in. Most of that is the meal estimates (about 10¢ each). "Thorough" accuracy
+mode roughly doubles the meal part. Reading the scale and sorting the week's photos add
+a few cents each.
 
 Optional: a free [USDA FoodData Central API key](https://fdc.nal.usda.gov/api-key-signup)
 gives more generous rate limits than the shared demo key used by default.
